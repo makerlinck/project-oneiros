@@ -1,0 +1,9 @@
+.venv/
+.python-version
+*.lock
+.uv-cache/
+runs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,36 @@
+[project]
+name = "life-sandbox"
+version = "0.1.0"
+description = "Oneiros life sandbox: one ECS world, all experiments are configuration."
+readme = "README.md"
+authors = [
+    { name = "makerlinck", email = "makerlinck@outlook.com" }
+]
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "jax>=0.12",
+    "numpy>=2.0",
+]
+
+[project.scripts]
+life-sandbox = "life_sandbox.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
