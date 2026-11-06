@@ -304,6 +304,9 @@ def _reseed(
     """
     if not cfg.world.reseed_enabled:
         return state, buffer
+    limit = int(cfg.world.reseed_until_tick)
+    if limit >= 0 and int(state.tick) >= limit:
+        return state, buffer
     creature = state.entities.creature
     capacity = creature.alive.shape[0]
     n_seed = min(RESEED_COUNT, capacity)

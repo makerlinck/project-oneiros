@@ -42,6 +42,10 @@ class WorldConfig:
     odor_scale: int = 1_000_000
     bush_regen_rate: float = 0.03
     bush_regen_base: float = 1e-4
+    # M1 K calibration: nuts (species 2) can regrow faster than berries.
+    bush_regen_nut_multiplier: float = 1.0
+    # Diagnostics: allow reseeds only before this tick (-1 = no limit).
+    reseed_until_tick: int = -1
     temperature_scale: float = 1.0
     # Emergency reseed on population < 8 (§5.5).  Diagnostics set this off to
     # observe the true dynamics without rescue.

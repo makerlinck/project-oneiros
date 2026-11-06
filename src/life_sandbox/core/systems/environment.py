@@ -86,7 +86,9 @@ def berry_growth(arena: BushArena, tick, cfg: Config, params=None) -> BushArena:
     else:
         rate = params.bush_regen_rate
         base = params.bush_regen_base
-    increment = (rate * stock * (1.0 - stock) + base) * ramp.berry_multiplier(
+    nut = jnp.asarray(cfg.world.bush_regen_nut_multiplier, jnp.float32)
+    factor = jnp.where(arena.edible.kind == 2, nut, 1.0)
+    increment = (rate * stock * (1.0 - stock) + base) * factor * ramp.berry_multiplier(
         tick, cfg, params
     )
     grown = jnp.clip(stock + increment, 0.0, 1.0)
