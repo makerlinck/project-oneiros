@@ -150,7 +150,7 @@ class BodyConfig:
     # N(toxin_mean, std).  The 2026-11-06 diagnostics showed that animal-heavy
     # founders starve because meat only comes from carcasses/living creatures.
     founder_plant_logit_mean: float = 0.0
-    founder_animal_logit_mean: float = 0.0
+    founder_animal_logit_mean: float = -1.0
     founder_toxin_logit_mean: float = -3.0
     founder_logit_std: float = 1.0
 

@@ -11,10 +11,7 @@ import jax.numpy as jnp
 
 from life_sandbox.core import components as C
 
-DIGEST_RATE: float = 0.0135
-ABSORPTION: float = 0.9
-ANIMAL_MARGIN: float = 1.3
-STOCK_MIN: float = 0.3
+STOCK_MIN: float = 0.05
 TOXIC_SHARE: float = 0.05
 
 
@@ -27,21 +24,28 @@ def toxic_share_per_slot(comp, kind):
     return comp[:, C.TOXIN][kind]
 
 
-def eligible_species_mask(rho, comp, kind, alive, c_tot):
-    """A bush slot is eligible if its animal supply covers 1.3x demand."""
-    rho_animal = rho[:, C.ANIMAL]
-    share = animal_share_per_slot(comp, kind)
-    supplied = DIGEST_RATE * ABSORPTION * jnp.sqrt(rho_animal)[:, None] * share[None, :]
-    return alive[None, :] & (supplied >= ANIMAL_MARGIN * rho_animal[:, None] * c_tot)
+def coverage_scores(rho, comp):
+    """Per-species coverage: min over P/A of c_{s,j} / sqrt(rho_j)."""
+    ratios = comp[None, :, :2] / jnp.sqrt(jnp.maximum(rho[:, None, :2], 1e-12))
+    return ratios.min(axis=-1)
 
 
-def _pick(candidates, distance, stock):
-    base = jnp.where(candidates, distance, jnp.inf)
-    stocked = jnp.where(candidates & (stock[None, :] >= STOCK_MIN), distance, jnp.inf)
-    picked = jnp.where(jnp.any(jnp.isfinite(stocked), axis=1, keepdims=True), stocked, base)
-    return jnp.where(
-        jnp.any(jnp.isfinite(picked), axis=1, keepdims=True), picked, distance
+def _rank_row(ranked, rank, kind, alive, stock, distance):
+    species = ranked[:, rank]
+    eligible = alive[None, :] & (kind[None, :] == species[:, None])
+    stocked = eligible & (stock[None, :] >= STOCK_MIN)
+    row = jnp.where(stocked, distance, jnp.inf)
+    row = jnp.where(
+        jnp.any(jnp.isfinite(row), axis=1, keepdims=True),
+        row,
+        jnp.where(eligible, distance, jnp.inf),
     )
+    row = jnp.where(
+        jnp.any(jnp.isfinite(row), axis=1, keepdims=True),
+        row,
+        jnp.where(alive[None, :], distance, jnp.inf),
+    )
+    return row, species
 
 
 def select_bush_slot(
@@ -51,21 +55,25 @@ def select_bush_slot(
     alive,
     stock,
     distance,
-    c_tot,
     body_toxin,
     stationary: bool = False,
 ):
-    """Return the bush slot each creature targets (v2 rules, fixed indices)."""
+    """Return the bush slot each creature targets (coverage rule, v3)."""
     if stationary:
         return jnp.argmin(jnp.where(alive[None, :], distance, jnp.inf), axis=1)
-    eligible = eligible_species_mask(rho, comp, kind, alive, c_tot)
-    pick = _pick(eligible, distance, stock)
-    slot = jnp.argmin(pick, axis=1)
-    toxic = toxic_share_per_slot(comp, kind)
-    own_toxic = toxic[slot] > TOXIC_SHARE
+    scores = coverage_scores(rho, comp)
+    ranked = jnp.argsort(-scores, axis=1)
+    top, _species = _rank_row(ranked, 0, kind, alive, stock, distance)
+    second, species_second = _rank_row(ranked, 1, kind, alive, stock, distance)
+    third, species_third = _rank_row(ranked, 2, kind, alive, stock, distance)
+
+    toxic_per_species = comp[:, C.TOXIN]
+    own_species = ranked[:, 0]
     needs_toxin = body_toxin >= 0.5 * rho[:, C.TOXIN]
-    switch = own_toxic & needs_toxin
-    non_toxic = eligible & (toxic[None, :] <= TOXIC_SHARE)
-    alternative = _pick(non_toxic, distance, stock)
-    pick = jnp.where(switch[:, None], alternative, pick)
-    return jnp.argmin(pick, axis=1)
+    switch = needs_toxin & (toxic_per_species[own_species] > TOXIC_SHARE)
+
+    second_ok = toxic_per_species[species_second] <= TOXIC_SHARE
+    third_ok = toxic_per_species[species_third] <= TOXIC_SHARE
+    alternative = jnp.where(second_ok[:, None], second, jnp.where(third_ok[:, None], third, top))
+    row = jnp.where(switch[:, None], alternative, top)
+    return jnp.argmin(row, axis=1)

@@ -34,59 +34,57 @@ def test_toxic_share_uses_the_toxin_column():
     assert [float(value) for value in toxic] == pytest.approx([0.0, 0.4, 0.6])
 
 
-def test_cold_species_is_ineligible_for_animal_heavy_diet():
-    rho = jnp.asarray([[0.05, 0.9, 0.05]], jnp.float32)
+def test_coverage_picks_nut_for_balanced_diet():
+    rho = jnp.asarray([[0.5, 0.5, 0.0]], jnp.float32)
+    scores = probe.coverage_scores(rho, COMP)
+    assert int(jnp.argmax(scores[0])) == 2
+
+
+def test_coverage_does_not_pick_nut_for_plant_heavy_diet():
+    rho = jnp.asarray([[0.9, 0.08, 0.02]], jnp.float32)
+    scores = probe.coverage_scores(rho, COMP)
+    assert int(jnp.argmax(scores[0])) == 1
+
+
+def test_selection_picks_species_by_coverage():
+    rho = jnp.asarray([[0.5, 0.5, 0.0]], jnp.float32)
     kind = jnp.asarray([0, 1, 2], jnp.int32)
     alive = jnp.ones((3,), jnp.bool_)
-    mask = probe.eligible_species_mask(rho, COMP, kind, alive, 0.002)
-    assert not bool(mask[0, 0])  # cold: 0.15 animal
-    assert bool(mask[0, 1])  # temperate: 0.25 animal
-    assert bool(mask[0, 2])  # nut: 0.40 animal
+    stock = jnp.ones((3,), jnp.float32)
+    distance = jnp.asarray([[1.0, 1.0, 10.0]], jnp.float32)
+    slot = probe.select_bush_slot(rho, COMP, kind, alive, stock, distance, jnp.asarray([0.1]))
+    assert int(slot[0]) == 2
 
 
-def test_low_animal_diet_accepts_cold_bush():
-    rho = jnp.asarray([[0.93, 0.02, 0.05]], jnp.float32)
-    kind = jnp.asarray([0, 2], jnp.int32)
-    alive = jnp.ones((2,), jnp.bool_)
-    mask = probe.eligible_species_mask(rho, COMP, kind, alive, 0.002)
-    assert bool(mask[0, 0])
+def test_selection_uses_stock_threshold_005():
+    rho = jnp.asarray([[0.5, 0.5, 0.0]], jnp.float32)
+    kind = jnp.asarray([0, 1, 2], jnp.int32)
+    alive = jnp.ones((3,), jnp.bool_)
+    stock = jnp.asarray([0.01, 0.01, 0.2], jnp.float32)
+    distance = jnp.asarray([[1.0, 2.0, 3.0]], jnp.float32)
+    slot = probe.select_bush_slot(rho, COMP, kind, alive, stock, distance, jnp.asarray([0.1]))
+    assert int(slot[0]) == 2
 
 
-def test_selection_prefers_eligible_species_over_nearer_ineligible_one():
-    rho = jnp.asarray([[0.05, 0.9, 0.05]], jnp.float32)
-    kind = jnp.asarray([0, 2], jnp.int32)  # slot 0 cold (ineligible), slot 1 nut
-    alive = jnp.ones((2,), jnp.bool_)
-    stock = jnp.ones((2,), jnp.float32)
-    distance = jnp.asarray([[1.0, 10.0]], jnp.float32)
-    slot = probe.select_bush_slot(
-        rho, COMP, kind, alive, stock, distance, 0.002, jnp.asarray([0.1])
-    )
-    assert int(slot[0]) == 1
+def test_selection_switches_away_from_toxic_species():
+    comp = jnp.asarray([[0.6, 0.4, 0.0], [0.75, 0.25, 0.0], [0.6, 0.4, 0.0]], jnp.float32)
+    comp = comp.at[2, C.TOXIN].set(0.4)
+    rho = jnp.asarray([[0.5, 0.5, 0.0]], jnp.float32)
+    kind = jnp.asarray([0, 1, 2], jnp.int32)
+    alive = jnp.ones((3,), jnp.bool_)
+    stock = jnp.ones((3,), jnp.float32)
+    distance = jnp.asarray([[1.0, 2.0, 0.5]], jnp.float32)
+    slot = probe.select_bush_slot(rho, comp, kind, alive, stock, distance, jnp.asarray([1.0]))
+    assert int(slot[0]) != 2
 
 
-def test_selection_switches_away_from_toxic_bush_when_toxin_reserve_is_high():
-    comp = jnp.asarray(
-        [[0.6, 0.4, 0.0], [0.6, 0.4, 0.0], [0.6, 0.4, 0.0]], jnp.float32
-    )
-    comp = comp.at[0, C.TOXIN].set(0.4)  # slot 0 toxic
-    rho = jnp.asarray([[0.35, 0.6, 0.05]], jnp.float32)
-    kind = jnp.asarray([0, 2], jnp.int32)
-    alive = jnp.ones((2,), jnp.bool_)
-    stock = jnp.ones((2,), jnp.float32)
-    distance = jnp.asarray([[1.0, 10.0]], jnp.float32)
-    slot = probe.select_bush_slot(
-        rho, comp, kind, alive, stock, distance, 0.002, jnp.asarray([1.0])
-    )
-    assert int(slot[0]) == 1
-
-
-def test_stationary_selection_ignores_eligibility_and_picks_nearest():
-    rho = jnp.asarray([[0.05, 0.9, 0.05]], jnp.float32)
+def test_stationary_selection_ignores_coverage_and_picks_nearest():
+    rho = jnp.asarray([[0.5, 0.5, 0.0]], jnp.float32)
     kind = jnp.asarray([0, 2], jnp.int32)
     alive = jnp.ones((2,), jnp.bool_)
     stock = jnp.ones((2,), jnp.float32)
     distance = jnp.asarray([[1.0, 10.0]], jnp.float32)
     slot = probe.select_bush_slot(
-        rho, COMP, kind, alive, stock, distance, 0.002, jnp.asarray([0.0]), stationary=True
+        rho, COMP, kind, alive, stock, distance, jnp.asarray([0.0]), stationary=True
     )
     assert int(slot[0]) == 0

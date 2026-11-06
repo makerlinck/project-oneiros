@@ -673,24 +673,57 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
         "founders": _group_stats(founder_counts, founders_total),
         "reproduction_born": _group_stats(repro_counts, births_total),
         "mean_r0_all_individuals": births_total / max(individuals, 1),
-        "reproducing_parents": len(founder_counts) + len(repro_counts),
-        "mean_r0_reproducing": (
-            float(np.mean(founder_counts + repro_counts))
-            if founder_counts or repro_counts
-            else None
-        ),
-        "max_r0": int(max(founder_counts + repro_counts)) if founder_counts or repro_counts else 0,
-        "fraction_reproducing_with_2plus": (
-            float(np.mean([value >= 2 for value in founder_counts + repro_counts]))
-            if founder_counts or repro_counts
-            else None
-        ),
-        "fraction_reproducing_with_3plus": (
-            float(np.mean([value >= 3 for value in founder_counts + repro_counts]))
-            if founder_counts or repro_counts
-            else None
-        ),
+        "completed_lifetimes": {},
     }
+    dead_founders = dead_repro = 0
+    completed_births = {"founders": 0, "reproduction_born": 0}
+    for world, data in enumerate(result["worlds"]):
+        dead_uids = {row[1] for row in data["deaths"]}
+        for row in data["deaths"]:
+            if row[1] in data["births"]:
+                dead_repro += 1
+            else:
+                dead_founders += 1
+        for parent, count in data["births_by_parent"].items():
+            if int(parent) in dead_uids:
+                key = "reproduction_born" if parent in data["births"] else "founders"
+                completed_births[key] += int(count)
+
+    def _completed(dead, births):
+        return {
+            "dead_individuals": int(dead),
+            "births": int(births),
+            "mean_r0": (births / dead) if dead else None,
+        }
+
+    r0["completed_lifetimes"] = {
+        "founders": _completed(dead_founders, completed_births["founders"]),
+        "reproduction_born": _completed(dead_repro, completed_births["reproduction_born"]),
+        "all": _completed(
+            dead_founders + dead_repro,
+            completed_births["founders"] + completed_births["reproduction_born"],
+        ),
+        "note": "only individuals with a death record inside the run; alive-at-end excluded",
+    }
+    r0["reproducing_parents"] = len(founder_counts) + len(repro_counts)
+    r0["mean_r0_reproducing"] = (
+        float(np.mean(founder_counts + repro_counts))
+        if founder_counts or repro_counts
+        else None
+    )
+    r0["max_r0"] = (
+        int(max(founder_counts + repro_counts)) if founder_counts or repro_counts else 0
+    )
+    r0["fraction_reproducing_with_2plus"] = (
+        float(np.mean([value >= 2 for value in founder_counts + repro_counts]))
+        if founder_counts or repro_counts
+        else None
+    )
+    r0["fraction_reproducing_with_3plus"] = (
+        float(np.mean([value >= 3 for value in founder_counts + repro_counts]))
+        if founder_counts or repro_counts
+        else None
+    )
     track_summary = None
     if result.get("tracker"):
         max_ratio, ever_above, above_fractions, limiting_counts = [], 0, [], Counter()
