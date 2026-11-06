@@ -102,6 +102,32 @@ def coarse_config(index: int) -> tuple[Config, dict]:
     return cfg, params
 
 
+def config_from_params(params: dict) -> Config:
+    """Build a calibration config from one parameter dict (shared with round 2)."""
+    base = Config.default()
+    cfg = base.replaced(
+        capacities=Capacities(
+            creature=256, bush=int(params["bush_capacity"]), carcass=64, neutral=3
+        ),
+        world=WorldConfig(
+            bush_regen_rate=params["bush_regen_rate"],
+            bush_regen_base=params["bush_regen_base"],
+            temperature_scale=params["temperature_scale"],
+            founders=64,
+            ramp_ticks=params["ramp_ticks"],
+        ),
+        body=BodyConfig(
+            base_metabolism=params["base_metabolism"],
+            founder_reserves=params["founder_reserves"],
+        ),
+        brain=BrainConfig(kind="plastic_rnn"),
+        learning=LearningConfig(plasticity=False, prediction=False),
+        run=RunConfig(seed=0, ticks=512, segment_ticks=64),
+    )
+    cfg.validate()
+    return cfg
+
+
 def sample_config(rng: random.Random, index: int) -> tuple[Config, dict]:
     """Draw one calibration config from the agreed round-1 space."""
     # Ranges are the feasibility region measured by the 2026-11-06 micro-sweep:
