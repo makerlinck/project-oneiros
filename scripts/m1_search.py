@@ -5,6 +5,9 @@ Random search over the calibration knobs agreed in the review:
     founder_reserves, ramp_ticks, temperature_scale.
 
 Round 1: N configs x W worlds x 20*L ticks, batched with vmap on one device.
+The batch is one config's worlds at a time; on a 3090, W=16 reaches ~2400
+world-ticks/s (measured), so a 24-config round is ~20-30 minutes including one
+compile per config (the segment equals one L chunk).
 Round 2: the best configs with more worlds plus the randomized-genome control.
 
 The driver is a host-side experiment script: it never changes the engine, seeds
@@ -83,7 +86,9 @@ def sample_config(rng: random.Random, index: int) -> tuple[Config, dict]:
         ),
         brain=BrainConfig(kind="plastic_rnn"),
         learning=LearningConfig(plasticity=False, prediction=False),
-        run=RunConfig(seed=0, ticks=500, segment_ticks=64),
+        # One compiled scan per config: the whole L-sized chunk is the segment,
+        # so a config compiles once and the 20 cycles reuse the compiled fn.
+        run=RunConfig(seed=0, ticks=500, segment_ticks=500),
     )
     cfg.validate()
     return cfg, params
@@ -286,7 +291,7 @@ def main() -> None:
             ),
             brain=BrainConfig(kind="plastic_rnn"),
             learning=LearningConfig(plasticity=False, prediction=False),
-            run=RunConfig(seed=0, ticks=args.l_ticks, segment_ticks=64),
+            run=RunConfig(seed=0, ticks=args.l_ticks, segment_ticks=args.l_ticks),
         )
         worlds = [estimate_lifespan(cfg, args.seed_base + 5000 + i, args.l_ticks, args.cycles) for i in range(10)]
         entry = {"index": record["index"], "params": params, "worlds": worlds}
