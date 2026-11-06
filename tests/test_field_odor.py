@@ -280,3 +280,63 @@ def test_apply_traces_under_jit():
     out, buffer = compiled(out, cfg)
     assert out.fields.odor.shape == cfg.world.grid_shape + (CHANNELS,)
     assert int(buffer.count) == 0
+
+def test_temperature_ramp_scales_the_whole_amplitude():
+    plain = make_cfg()
+    ramped = make_cfg(ramp_ticks=10)  # ramp_temperature_multiplier defaults to 0.2
+    # tick 0: 0.2x; halfway through the ramp: 0.2 + 0.8 * 0.5 = 0.6x.
+    for tick, multiplier in ((0, 0.2), (5, 0.6)):
+        for y in (0.0, 4.0, 8.0):
+            base = float(fields.temperature(plain, y, tick))
+            assert float(fields.temperature(ramped, y, tick)) == pytest.approx(
+                multiplier * base, rel=1e-6, abs=1e-7
+            ), (tick, y)
+    # The in-bush -0.5 offset is part of the temperature difference, so it scales.
+    plain_inside = float(fields.temperature(plain, 4.0, 0, True))
+    plain_outside = float(fields.temperature(plain, 4.0, 0, False))
+    ramp_inside = float(fields.temperature(ramped, 4.0, 0, True))
+    ramp_outside = float(fields.temperature(ramped, 4.0, 0, False))
+    assert ramp_inside - ramp_outside == pytest.approx(
+        0.2 * (plain_inside - plain_outside), rel=1e-6, abs=1e-7
+    )
+    # Once the ramp is over the full amplitude is back.
+    assert float(fields.temperature(ramped, 4.0, 10)) == pytest.approx(
+        float(fields.temperature(plain, 4.0, 10)), rel=1e-6
+    )
+    # Light is not ramped (§9 only scales the temperature difference).
+    for tick in (0, 5, 10):
+        assert float(fields.light(ramped, tick)) == pytest.approx(
+            float(fields.light(plain, tick)), rel=1e-6
+        )
+
+
+def test_environment_at_uses_the_ramped_temperature():
+    plain = make_cfg()
+    ramped = make_cfg(ramp_ticks=10)
+    base_state = _put_creature(state_of(plain), 0, [4.0, 2.0])
+    ramp_state = _put_creature(state_of(ramped), 0, [4.0, 2.0])
+    base_temperature, base_light = fields.environment_at(base_state, plain)
+    ramp_temperature, ramp_light = fields.environment_at(ramp_state, ramped)
+    assert float(ramp_temperature[0]) == pytest.approx(
+        0.2 * float(base_temperature[0]), rel=1e-6, abs=1e-7
+    )
+    assert float(ramp_light[0]) == pytest.approx(float(base_light[0]), rel=1e-6)
+
+
+def test_ramped_fields_trace_under_jit():
+    cfg = make_cfg(ramp_ticks=10)
+    state = _put_creature(state_of(cfg), 0, [4.0, 2.0])
+    state = _put_bush(state, 0, [4.0, 2.0], stock=0.5, kind=0)
+    compiled = jax.jit(fields.apply, static_argnums=(1,))
+    out, buffer = compiled(state, cfg)
+    out, buffer = compiled(out, cfg)
+    assert out.fields.odor.shape == cfg.world.grid_shape + (CHANNELS,)
+    assert int(buffer.count) == 0
+
+    compiled_at = jax.jit(fields.environment_at, static_argnums=(1,))
+    temperature, _ = compiled_at(state, cfg)
+    base_temperature, _ = fields.environment_at(state, make_cfg())
+    assert float(temperature[0]) == pytest.approx(
+        0.2 * float(base_temperature[0]), rel=1e-6, abs=1e-7
+    )
+

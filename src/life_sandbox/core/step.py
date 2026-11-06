@@ -170,6 +170,133 @@ def _merge_event_tables(target: dict[str, np.ndarray] | None, table: dict[str, n
             target[name] = values
 
 
+@functools.lru_cache(maxsize=64)
+def _compiled_batch_segment(cfg: Config, ticks: int):
+    """Jitted segment runner over a batch of worlds (leading axis = world)."""
+
+    def _run(states: WorldState):
+        return _scan_run_batch(states, cfg, ticks)
+
+    return jax.jit(_run)
+
+
+def _scan_run_batch(
+    states: WorldState, cfg: Config, ticks: int
+) -> tuple[WorldState, jax.Array, events.EventBuffer, C.Ledger]:
+    """Chunked run over B worlds: one scan, vmap(step) per tick (SANDBOX.md §3.3)."""
+    batched_step = jax.vmap(lambda state: step(state, cfg))
+    batched_counts = jax.vmap(_event_counts)
+
+    def body(carry, _):
+        current, totals = carry
+        current, buffer = batched_step(current)
+        return (current, totals + batched_counts(buffer)), (buffer, current.ledger)
+
+    initial = jnp.zeros((len(events.EVENT_KINDS),), dtype=jnp.int32)
+    initial = jnp.broadcast_to(initial, (states.tick.shape[0], len(events.EVENT_KINDS)))
+    (states, totals), (buffers, ledgers) = jax.lax.scan(body, (states, initial), None, length=ticks)
+    return states, totals, buffers, ledgers
+
+
+@dataclass
+class RunBatchResult:
+    """Host-side result of a batched run (leading axis = world)."""
+
+    states: WorldState
+    counts: np.ndarray  # int64[B, KINDS]
+    ticks: int
+    inflow: np.ndarray  # float64[B, INFLOW, 3]
+    outflow: np.ndarray  # float64[B, OUTFLOW, 3]
+    transfer_from: np.ndarray  # float64[B, 3]
+    transfer_to: np.ndarray
+    digested: np.ndarray
+    dropped_events: int = 0
+
+    def counts_dict(self, world: int) -> dict[str, int]:
+        row = self.counts[world]
+        return {
+            name: int(row[index])
+            for index, name in enumerate(events.EVENT_KINDS)
+            if int(row[index])
+        }
+
+
+def run_batch(
+    states: WorldState,
+    cfg: Config,
+    ticks: int,
+    *,
+    compile: bool = True,
+    segment: int | None = None,
+) -> RunBatchResult:
+    """Run B worlds together with vmap inside one lax.scan segment loop.
+
+    'states' is a batched WorldState (leading axis = world).  Per-world ledger
+    sums are kept in float64 on the host; event tables are not collected here
+    (M2 logging will stream them per segment).
+    """
+    ticks = int(ticks)
+    segment = int(cfg.run.segment_ticks) if segment is None else int(segment)
+    batch = int(states.tick.shape[0])
+    inflow = np.zeros((batch, C.N_INFLOW_CATEGORIES, C.N_NUTRIENTS), dtype=np.float64)
+    outflow = np.zeros((batch, C.N_OUTFLOW_CATEGORIES, C.N_NUTRIENTS), dtype=np.float64)
+    transfer_from = np.zeros((batch, C.N_NUTRIENTS), dtype=np.float64)
+    transfer_to = np.zeros((batch, C.N_NUTRIENTS), dtype=np.float64)
+    digested = np.zeros((batch, C.N_NUTRIENTS), dtype=np.float64)
+    counts_total = np.zeros((batch, len(events.EVENT_KINDS)), dtype=np.int64)
+    dropped = 0
+
+    def ledger_total(name, frame_axis):
+        values = np.asarray(getattr(ledgers_holder["ledger"], name), dtype=np.float64)
+        if frame_axis is not None:
+            values = values.sum(axis=0)
+        return values
+
+    # Bind per call (Python closure assignment keeps mypy quiet about rebinding).
+    ledgers_holder: dict[str, object] = {"ledger": None}
+
+    def absorb(counts_vec, ledgers, frame_axis):
+        ledgers_holder["ledger"] = ledgers
+        inflow[:] += ledger_total("inflow", frame_axis)
+        outflow[:] += ledger_total("outflow", frame_axis)
+        transfer_from[:] += ledger_total("transfer_from", frame_axis)
+        transfer_to[:] += ledger_total("transfer_to", frame_axis)
+        digested[:] += ledger_total("digested", frame_axis)
+        counts_total[:] += np.asarray(counts_vec, dtype=np.int64)
+
+    if compile:
+        remaining = ticks
+        while remaining > 0:
+            size = min(segment, remaining)
+            states, counts_vec, buffers, ledgers = _compiled_batch_segment(cfg, size)(states)
+            absorb(counts_vec, ledgers, 0)
+            dropped += int(np.asarray(buffers.dropped).sum())
+            remaining -= size
+            for world in range(batch):
+                masks.ensure_uid_headroom(states.uid_counter[world])
+    else:
+        batched_step = jax.vmap(lambda state: step(state, cfg))
+        for _ in range(ticks):
+            states, buffers = batched_step(states)
+            counts_vec = jax.vmap(_event_counts)(buffers)
+            absorb(counts_vec, states.ledger, None)
+            dropped += int(np.asarray(buffers.dropped).sum())
+            for world in range(batch):
+                masks.ensure_uid_headroom(states.uid_counter[world])
+
+    return RunBatchResult(
+        states=states,
+        counts=counts_total,
+        ticks=ticks,
+        inflow=inflow,
+        outflow=outflow,
+        transfer_from=transfer_from,
+        transfer_to=transfer_to,
+        digested=digested,
+        dropped_events=dropped,
+    )
+
+
 @dataclass
 class RunResult:
     """Host-side result of one run segment loop.

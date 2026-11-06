@@ -4,8 +4,10 @@ Owner: world teammate.  Contract: apply(state, cfg) -> (WorldState, EventBuffer)
 
 What one tick does, in this fixed order:
 
-1. Berry regeneration (§4.2): stock += 0.03*stock*(1 - stock) + 1e-4, clipped to
-   [0, 1] because stock is a fraction with that range.
+1. Berry regeneration (§4.2): stock += (0.03*stock*(1 - stock) + 1e-4) *
+   ramp.berry_multiplier(tick, cfg), clipped to [0, 1] because stock is a
+   fraction with that range.  The startup ramp (§9) starts at three times the
+   regeneration and reaches the target at world.ramp_ticks.
 2. Carcass rot (§4.2): 0.5% of plant and animal matter becomes toxin every tick.
    The conversion is an internal transfer in the nutrient book (§3.5), so it is
    recorded as ledger.transfer_from = [rotP, rotA, 0] and
@@ -18,7 +20,9 @@ What one tick does, in this fixed order:
    composition becomes 0.6 * base + 0.4 * toxin and every other species returns
    to the base composition.  The switch event carries the species index in the
    x field (the event buffer has no dedicated column).  Appearance and odour do
-   not change: only the consequences differ (§4.3).
+   not change: only the consequences differ (§4.3).  While the startup ramp is
+   still running (ramp.toxin_active is false, §9) no switch happens and comp is
+   reset to INITIAL_COMP every tick, so berries carry no toxin.
 4. Neutral objects (§4.5): scripted wander.  The browser only specifies a random
    walk, so the parameters below are local choices: speed 0.08 units/tick and a
    new random heading every 30-90 ticks, reflecting off the walls.
@@ -33,7 +37,7 @@ import jax
 import jax.numpy as jnp
 
 from life_sandbox.config import Config
-from life_sandbox.core import events, masks, rng
+from life_sandbox.core import events, masks, ramp, rng
 from life_sandbox.core.components import (
     OUTFLOW_DECOMPOSITION,
     BushArena,
@@ -65,11 +69,18 @@ NEUTRAL_TIMER_MAX: int = 90
 _EMPTY_EPS = 1e-9
 
 
-def berry_growth(arena: BushArena) -> BushArena:
-    """One regeneration step for the bush stock field (§4.2)."""
+def berry_growth(arena: BushArena, tick, cfg: Config) -> BushArena:
+    """One regeneration step for the bush stock field (§4.2, §9).
+
+    The logistic increment (not the standing stock) is scaled by the startup
+    ramp multiplier before clipping, so the ramp makes berries regrow faster
+    without changing the [0, 1] range.
+    """
     stock = arena.edible.stock
-    grown = stock + BERRY_GROWTH * stock * (1.0 - stock) + BERRY_SEED
-    grown = jnp.clip(grown, 0.0, 1.0)
+    increment = (BERRY_GROWTH * stock * (1.0 - stock) + BERRY_SEED) * ramp.berry_multiplier(
+        tick, cfg
+    )
+    grown = jnp.clip(stock + increment, 0.0, 1.0)
     stock = jnp.where(arena.alive, grown, stock)
     return update(arena, edible=update(arena.edible, stock=stock))
 
@@ -138,10 +149,16 @@ def carcass_rot(arena: CarcassArena) -> tuple[CarcassArena, jax.Array, jax.Array
 def toxin_composition(
     state: WorldState, cfg: Config, key: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Reassigned berry composition, the chosen species and the switch flag (§4.4)."""
+    """Reassigned berry composition, the chosen species and the switch flag.
+
+    During the startup ramp the schedule is off and the composition is pinned to
+    INITIAL_COMP (no toxin) every tick (§9); once ramp.toxin_active is true the
+    normal §4.4 schedule resumes.
+    """
     period = max(1, int(round(float(cfg.world.c_switch) * float(cfg.world.l_ticks))))
     tick = state.tick
-    switch_now = (tick > 0) & (jnp.mod(tick, jnp.asarray(period, jnp.int32)) == 0)
+    active = ramp.toxin_active(tick, cfg)
+    switch_now = (tick > 0) & (jnp.mod(tick, jnp.asarray(period, jnp.int32)) == 0) & active
 
     base = jnp.asarray(INITIAL_COMP, jnp.float32)
     n_species = base.shape[0]
@@ -150,6 +167,7 @@ def toxin_composition(
     toxic = 0.6 * base + TOXIN_SHARE * toxin[None, :]
     switched = jnp.where((jnp.arange(n_species, dtype=jnp.int32) == chosen)[:, None], toxic, base)
     comp = jnp.where(switch_now, switched, state.comp)
+    comp = jnp.where(active, comp, base)
     return comp, chosen, switch_now
 
 
@@ -211,7 +229,7 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     key = rng.system_key(state.key, state.tick, "environment")
     switch_key, wander_key = rng.subsplit(key, 2)
 
-    bush = bush_appearance(berry_growth(state.entities.bush))
+    bush = bush_appearance(berry_growth(state.entities.bush, state.tick, cfg))
     carcass, rot_from, decomposition = carcass_rot(state.entities.carcass)
     entities = update(state.entities, bush=bush, carcass=carcass)
     entities = update(entities, neutral=neutral_wander(entities, cfg, wander_key))

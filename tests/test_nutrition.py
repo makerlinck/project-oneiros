@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import pytest
 
 from life_sandbox.brain.genome import layout as brain_layout
-from life_sandbox.config import Capacities, Config, MotionConfig
+from life_sandbox.config import Capacities, Config, MotionConfig, WorldConfig
 from life_sandbox.core import components as C, events
 from life_sandbox.core.state import empty
 from life_sandbox.core.struct import update
@@ -27,6 +27,15 @@ FLESH = jnp.asarray([0.3, 0.7, 0.0], jnp.float32)
 def small_cfg() -> Config:
     return Config.default().replaced(
         capacities=Capacities(creature=N, bush=6, carcass=2, neutral=1),
+        motion=MotionConfig(noise_scale=0.0),
+    )
+
+
+def ramp_cfg() -> Config:
+    """Tiny config with the startup ramp on (half upkeep at tick 0)."""
+    return Config.default().replaced(
+        capacities=Capacities(creature=N, bush=6, carcass=2, neutral=1),
+        world=WorldConfig(founders=2, ramp_ticks=10, ramp_metabolism_multiplier=0.5),
         motion=MotionConfig(noise_scale=0.0),
     )
 
@@ -479,3 +488,35 @@ def test_birth_fails_without_tissue():
     assert int(buffer.kind[0]) == events.kind_code("birth_fail")
     assert int(buffer.reason[0]) == events.reason_code("no_tissue")
     assert not bool(out.entities.creature.alive[1])
+
+
+def test_metabolism_ramp_scales_only_base_demand():
+    """§9 ramp: base upkeep = 0.5x at tick 0, 1x at ramp_ticks; work is unscaled."""
+    cfg = ramp_cfg()
+    rho = (0.2, 0.5, 0.3)
+    reserves = (0.1, 0.1, 0.1)  # below the repair threshold
+    movement = 0.002 * 1.0 * 1.0 * 1.0  # |u_acc'|=1, k=0, mass=1, m_held=0
+    for tick, multiplier in ((0, 0.5), (5, 0.75), (10, 1.0), (50, 1.0)):
+        state = body_state(cfg, rho=rho, reserves=reserves, u_eff=(1.0, 0.0))
+        state = update(state, tick=jnp.asarray(tick, jnp.int32))
+        out, _ = metabolism.apply(state, cfg)
+        demand = metabolism.BASE_METABOLISM * multiplier + movement
+        drop = jnp.asarray(reserves) - out.entities.creature.body.N[0]
+        assert jnp.allclose(drop, jnp.asarray(rho) * demand, atol=1e-6), tick
+        assert jnp.allclose(
+            out.ledger.outflow[C.OUTFLOW_METABOLISM], jnp.asarray(rho) * demand, atol=1e-6
+        ), tick
+
+
+def test_metabolism_ramp_does_not_scale_repair():
+    """Repair is physical work: its 0.002 is not multiplied by the ramp (§9)."""
+    cfg = ramp_cfg()
+    rho = (0.2, 0.5, 0.3)
+    reserves = (0.2, 0.2, 0.2)  # repair condition holds
+    state = body_state(cfg, rho=rho, reserves=reserves, integrity=0.5)
+    state = update(state, tick=jnp.asarray(0, jnp.int32))
+    out, _ = metabolism.apply(state, cfg)
+    demand = metabolism.BASE_METABOLISM * 0.5 + metabolism.REPAIR_RATE
+    drop = jnp.asarray(reserves) - out.entities.creature.body.N[0]
+    assert jnp.allclose(drop, jnp.asarray(rho) * demand, atol=1e-6)
+    assert float(out.entities.creature.body.I[0]) == pytest.approx(0.502, abs=1e-6)

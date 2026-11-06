@@ -409,3 +409,87 @@ def test_compiled_ledger_matches_eager():
             np.asarray(getattr(eager.ledger, name)),
             np.asarray(getattr(compiled.ledger, name)),
         ), name
+
+def _ramp_increment(stock: float) -> float:
+    """Berry regeneration increment before the ramp multiplier (§4.2, §9)."""
+    return 0.03 * stock * (1.0 - stock) + 1e-4
+
+
+def test_ramp_boosts_berry_regeneration():
+    plain = make_cfg()
+    ramped = make_cfg(ramp_ticks=10)  # ramp_berry_multiplier defaults to 3.0
+    stocks = [0.3, 0.5, 1.0]
+
+    plain_out, _ = environment.apply(set_stock(state_of(plain), stocks), plain)
+    ramp_out, _ = environment.apply(set_stock(state_of(ramped), stocks), ramped)
+    middle_out, _ = environment.apply(
+        at_tick(set_stock(state_of(ramped), stocks), 5), ramped
+    )
+    late_out, _ = environment.apply(
+        at_tick(set_stock(state_of(ramped), stocks), 10), ramped
+    )
+
+    plain_stock = np.asarray(plain_out.entities.bush.edible.stock)
+    ramp_stock = np.asarray(ramp_out.entities.bush.edible.stock)
+    middle_stock = np.asarray(middle_out.entities.bush.edible.stock)
+    late_stock = np.asarray(late_out.entities.bush.edible.stock)
+    for slot, start in enumerate(stocks):
+        increment = _ramp_increment(start)
+        assert plain_stock[slot] == pytest.approx(min(1.0, start + increment), abs=1e-7)
+        # tick 0: multiplier 3; tick 5: 3 + (1 - 3) * 0.5 = 2; tick 10: 1.
+        assert ramp_stock[slot] == pytest.approx(min(1.0, start + 3.0 * increment), abs=1e-7)
+        assert middle_stock[slot] == pytest.approx(min(1.0, start + 2.0 * increment), abs=1e-7)
+        assert late_stock[slot] == pytest.approx(min(1.0, start + increment), abs=1e-7)
+
+
+def test_ramp_blocks_the_toxin_switch_and_keeps_berries_nontoxic():
+    # Period 4 is shorter than the 10-tick ramp, so a switch would otherwise
+    # fire at ticks 4 and 8.
+    cfg = make_cfg(ramp_ticks=10, l_ticks=4.0, c_switch=1.0)
+    state = state_of(cfg)
+    poisoned = np.asarray(INITIAL_COMP).copy()
+    poisoned[0] = [0.51, 0.09, 0.40]
+    state = update(state, comp=jnp.asarray(poisoned, jnp.float32))
+
+    for tick in (0, 4, 8):
+        out, buffer = environment.apply(at_tick(state, tick), cfg)
+        assert int(buffer.count) == 0, tick
+        assert np.allclose(np.asarray(out.comp), BASE, atol=1e-7), tick  # no toxin
+
+    # The ramp is over at tick 10; the next period multiple switches normally.
+    out, buffer = environment.apply(at_tick(state, 12), cfg)
+    assert events.summary(buffer) == {"toxin_switch": 1}
+    chosen = int(buffer.uid[0])
+    toxic = 0.6 * BASE + 0.4 * np.asarray([0.0, 0.0, 1.0])
+    comp = np.asarray(out.comp)
+    for species in range(BASE.shape[0]):
+        expected = toxic[species] if species == chosen else BASE[species]
+        assert np.allclose(comp[species], expected, atol=1e-7), species
+
+
+def test_ramped_apply_traces_under_jit():
+    cfg = make_cfg(ramp_ticks=10, l_ticks=4.0, c_switch=1.0)
+    state = set_stock(state_of(cfg), [0.3, 0.5], kinds=[0, 1])
+    state = set_carcass(state, 0, [0.5, 0.4, 0.1], age=3)
+    state = at_tick(state, 4)  # inside the ramp, on a period multiple
+
+    eager, eager_buffer = environment.apply(state, cfg)
+    compiled = jax.jit(environment.apply, static_argnums=(1,))
+    out, buffer = compiled(state, cfg)
+    assert int(eager_buffer.count) == 0
+    assert int(buffer.count) == 0
+    assert np.allclose(np.asarray(out.comp), BASE, atol=1e-7)
+    assert np.allclose(
+        np.asarray(out.entities.bush.edible.stock),
+        np.asarray(eager.entities.bush.edible.stock),
+        atol=1e-6,
+    )
+    for name in ("transfer_from", "transfer_to", "outflow"):
+        assert np.allclose(
+            np.asarray(getattr(out.ledger, name)),
+            np.asarray(getattr(eager.ledger, name)),
+            atol=1e-9,
+        ), name
+    out, buffer = compiled(out, cfg)  # still traceable on the next tick
+    assert out.entities.bush.edible.stock.shape == (cfg.capacities.bush,)
+

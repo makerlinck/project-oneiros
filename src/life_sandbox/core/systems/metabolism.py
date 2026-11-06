@@ -34,6 +34,9 @@ Documented decisions (SANDBOX.md is silent):
 - The motion part of c_tot uses the effective controls Motor.u_eff = u' (the
   noise-added, clipped outputs the motion system applied, §5.3), not the raw
   intended outputs; the bite surcharge uses the intended u_bite.
+- The startup ramp (§9) multiplies only the base upkeep term by
+  ramp.metabolism_multiplier(tick, cfg); movement, bite and repair costs are
+  physical work and are not ramped.
 - Growth is all-or-nothing per tick: if any component of 0.1*delta_m*c_flesh
   is unavailable, the tick adds no mass.
 - "inside a bush" for shading is the centre within the bush radius; temperature
@@ -48,7 +51,7 @@ import jax.numpy as jnp
 
 from life_sandbox.config import Config
 from life_sandbox.core import components as C
-from life_sandbox.core import events, masks
+from life_sandbox.core import events, masks, ramp
 from life_sandbox.core.ledger import add_digested, add_outflow
 from life_sandbox.core.state import WorldState
 from life_sandbox.core.struct import update
@@ -149,11 +152,14 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         + 0.0005 * jnp.abs(u_eff[:, 1])
         + 0.002 * jnp.maximum(last[:, C.OUT_BITE], 0.0)
     ) * awake
+    # Startup ramp (§9): only the base demand is scaled, never the movement,
+    # bite or repair surcharges (those are physical work, not upkeep).
     base = (
         BASE_METABOLISM
         * (1.0 + KNOB_ENERGY_COEFF * knob * knob)
         * (1.0 + aging_bonus)
         * jnp.where(asleep, 0.5, 1.0)
+        * ramp.metabolism_multiplier(state.tick, cfg)
     )
     # Repair only happens while integrity is below 1 and reserves can pay for
     # it; the demand charges exactly the amount repaired this tick (§5.3).

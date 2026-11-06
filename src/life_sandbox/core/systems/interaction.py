@@ -104,7 +104,11 @@ def append_events_batch(buffer: events.EventBuffer, valid: jax.Array, **values) 
     """
     capacity = buffer.kind.shape[0]
     batch = valid.shape[0]
-    positions = buffer.count + jnp.arange(batch, dtype=jnp.int32)
+    # Valid rows must be compacted into a contiguous suffix of the buffer
+    # prefix: consumers read only the first `count` entries, so a sparse batch
+    # (e.g. only creature slots 3, 6, 7 are eligible) must not leave holes.
+    batch_rank = jnp.cumsum(valid.astype(jnp.int32)) - 1
+    positions = buffer.count + batch_rank
     inside = valid & (positions < capacity)
     over = valid & (positions >= capacity)
     index = jnp.where(inside, positions, jnp.asarray(capacity, jnp.int32))

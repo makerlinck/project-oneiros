@@ -33,6 +33,15 @@ Documented decisions (SANDBOX.md is silent):
 - Mutation scales come from brain/genome.mutation_sigmas (§6.3), and genome /
   fast-weight widths come from brain/genome.layout(cfg): they are derived from
   H, D, M and N_OUT, never configured by hand.
+- C5 birth budget: at most B_MAX births per tick.  Eligible parents are ordered
+  by a random permutation drawn from the reproduce key; the first B_MAX in that
+  order split this tick, the rest are deferred to a later tick (no payment, no
+  uid) and each emits a `birth_defer` event.  Mutation noise is drawn per
+  actual birth from fold_in(reproduce_key, child_uid), so a birth's genome does
+  not depend on which other births happen in the same tick; the draw is
+  batched to at most B_MAX x genome_dim per tick instead of
+  capacity x genome_dim.  The batch has a fixed B_MAX shape for jit tracing:
+  rows with no birth are drawn with a placeholder uid and never written.
 """
 
 from __future__ import annotations
@@ -58,6 +67,8 @@ BIRTH_LOSS: float = 0.02
 THETA_REPRO_MIN: float = 0.5
 THETA_REPRO_MAX: float = 1.0
 MATURE_EPS: float = 1e-6
+# Per-tick birth budget (C5).  A module constant so M1 calibration can tune it.
+B_MAX: int = 16
 
 _CHILD_ANGLES = jnp.asarray(
     [0.0, jnp.pi / 4, -jnp.pi / 4, jnp.pi / 2, -jnp.pi / 2, 3 * jnp.pi / 4, -3 * jnp.pi / 4],
@@ -153,7 +164,17 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     slots = jnp.arange(capacity, dtype=jnp.int32)
     eligible_mask = eligible(creature, cfg)
 
-    key_noise, key_theta = jax.random.split(rng.system_key(state.key, tick, "reproduce"), 2)
+    reproduce_key = rng.system_key(state.key, tick, "reproduce")
+    key_priority, key_theta = jax.random.split(reproduce_key, 2)
+
+    # C5 birth budget: rank the eligible parents by a random permutation from
+    # the reproduce key; the first B_MAX split, the rest defer to another tick.
+    perm = jax.random.permutation(key_priority, capacity).astype(jnp.int32)
+    eligible_in_priority = eligible_mask[perm].astype(jnp.int32)
+    priority_rank = jnp.cumsum(eligible_in_priority) - 1
+    eligible_rank = jnp.zeros(capacity, dtype=jnp.int32).at[perm].set(priority_rank)
+    budgeted = eligible_mask & (eligible_rank >= 0) & (eligible_rank < B_MAX)
+    deferred = eligible_mask & ~budgeted
 
     # Parent payment 1: tissue.
     flesh = jnp.asarray(C.FLESH_COMP, dtype=jnp.float32)
@@ -167,40 +188,71 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     first_free = jnp.argmax(free_position.astype(jnp.int32), axis=1)
     child_position = jnp.take_along_axis(positions, first_free[:, None, None], axis=1)[:, 0, :]
 
-    # Free slots are consumed in slot order by the successful parents.
+    # Free slots are consumed in slot order by the successful budgeted parents.
     free_slots = jnp.nonzero(
         ~creature.alive, size=capacity, fill_value=capacity
     )[0].astype(jnp.int32)
     free_count = jnp.sum(~creature.alive).astype(jnp.int32)
-    tentative = eligible_mask & tissue_ok & free_position_any
+    tentative = budgeted & tissue_ok & free_position_any
     tentative_rank = jnp.cumsum(tentative.astype(jnp.int32)) - 1
     success = tentative & (tentative_rank < free_count)
     success_rank = jnp.cumsum(success.astype(jnp.int32)) - 1
     child_slots = free_slots[jnp.clip(success_rank, 0, capacity - 1)]
+    num_success = jnp.sum(success).astype(jnp.int32)
 
-    # Child genome mutation (§6.3) and heading.  The genome width is the brain
-    # layout's derived total, not a configured number.
+    # Child genome mutation (§6.3, C5): one noise draw per actual birth, keyed
+    # by (reproduce_key, child_uid).  Genome width is the brain layout's
+    # derived total, not a configured number.
     lay = brain_genome.layout(cfg)
     sigma = brain_genome.mutation_sigmas(cfg)
-    noise = jax.random.normal(key_noise, (capacity, lay.total), dtype=jnp.float32)
-    child_genome = creature.genome.g + noise * sigma[None, :]
+    child_uid = state.uid_counter + success_rank
+    rank_index = jnp.where(success, success_rank, jnp.asarray(B_MAX, jnp.int32))
+    uid_by_rank = jnp.zeros((B_MAX,), jnp.int32).at[rank_index].set(
+        jnp.where(success, child_uid, 0)
+    )
+    slot_by_rank = jnp.full((B_MAX,), capacity, jnp.int32).at[rank_index].set(
+        jnp.where(success, child_slots, 0)
+    )
+    parent_by_rank = jnp.zeros((B_MAX,), jnp.int32).at[rank_index].set(
+        jnp.where(success, slots, 0)
+    )
+    child_keys = jax.vmap(lambda uid: jax.random.fold_in(reproduce_key, uid))(uid_by_rank)
+    noise = jax.vmap(
+        lambda child_key: jax.random.normal(child_key, (lay.total,), dtype=jnp.float32)
+    )(child_keys)
+    child_genome_by_rank = (
+        creature.genome.g[parent_by_rank] + noise * sigma[None, :]
+    )
     child_heading = jax.random.uniform(
         key_theta, (capacity,), dtype=jnp.float32, minval=-jnp.pi, maxval=jnp.pi
     )
 
-    # Parent payment 2-3: reserves and birth loss.
-    child_diet = world_init.diet_from_genome(child_genome, cfg)
-    child_reserves = jnp.minimum(CHILD_RESERVE_FRACTION * child_diet, parent_body.N)
-    parent_rho = world_init.diet_from_genome(creature.genome.g, cfg)
-    remaining_n = jnp.maximum(parent_body.N - child_reserves, 0.0)
-    birth_loss = jnp.minimum(BIRTH_LOSS * parent_rho, remaining_n)
+    # Parent payment 2-3: reserves and birth loss (computed per birth, then
+    # expanded back onto the parent rows for the payment scatter).
+    child_diet_by_rank = world_init.diet_from_genome(child_genome_by_rank, cfg)
+    child_reserves_by_rank = jnp.minimum(
+        CHILD_RESERVE_FRACTION * child_diet_by_rank,
+        parent_body.N[parent_by_rank],
+    )
+    parent_rho_by_rank = world_init.diet_from_genome(
+        creature.genome.g[parent_by_rank], cfg
+    )
+    remaining_by_rank = jnp.maximum(
+        parent_body.N[parent_by_rank] - child_reserves_by_rank, 0.0
+    )
+    birth_loss_by_rank = jnp.minimum(BIRTH_LOSS * parent_rho_by_rank, remaining_by_rank)
+    rank_in_range = jnp.arange(B_MAX, dtype=jnp.int32) < num_success
+    compact_index = jnp.clip(
+        jnp.where(success, success_rank, 0), 0, B_MAX - 1
+    )
+    child_reserves = child_reserves_by_rank[compact_index]
+    birth_loss = birth_loss_by_rank[compact_index]
     parent_n = parent_body.N - jnp.where(
         success[:, None], child_reserves + birth_loss, 0.0
     )
     parent_b = parent_body.B - jnp.where(success[:, None], tissue_cost[None, :], 0.0)
 
     # Child records.
-    child_uid = state.uid_counter + success_rank
     zero_like_uids = jnp.zeros((capacity,), dtype=jnp.int32)
     identity = C.Identity(
         uid=_scatter_rows(creature.identity.uid, child_slots, success, child_uid),
@@ -242,10 +294,14 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
             jnp.full((capacity,), CHILD_MASS, jnp.float32),
         ),
     )
-    child_look = world_init.look_from_genome(child_genome, cfg)
+    child_look_by_rank = world_init.look_from_genome(child_genome_by_rank, cfg)
     look = C.Look(
-        rgb=_scatter_rows(creature.look.rgb, child_slots, success, child_look.rgb),
-        odor=_scatter_rows(creature.look.odor, child_slots, success, child_look.odor),
+        rgb=_scatter_rows(
+            creature.look.rgb, child_slots, success, child_look_by_rank.rgb[compact_index]
+        ),
+        odor=_scatter_rows(
+            creature.look.odor, child_slots, success, child_look_by_rank.odor[compact_index]
+        ),
     )
     body = C.Body(
         G=_scatter_rows(
@@ -263,7 +319,10 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
         X=_scatter_rows(
             creature.body.X, child_slots, success, jnp.zeros((capacity,), jnp.float32)
         ),
-        b=_scatter_rows(creature.body.b, child_slots, success, creature.body.b),
+        b=_scatter_rows(
+            creature.body.b, child_slots, success,
+            creature.body.b[parent_by_rank][compact_index],
+        ),
         k=_scatter_rows(
             creature.body.k, child_slots, success, jnp.zeros((capacity,), jnp.float32)
         ),
@@ -286,7 +345,17 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
             creature.body.mu, child_slots, success, jnp.zeros((capacity,), jnp.float32)
         ),
     )
-    genome = C.Genome(g=_scatter_rows(creature.genome.g, child_slots, success, child_genome))
+    # Scatter the compact (B_MAX x genome_dim) child genomes row by row: no
+    # capacity x genome_dim temporary is ever built (C5).
+    def _write_child_genome(row, genome_values):
+        index = jnp.where(
+            row < num_success, slot_by_rank[row], jnp.asarray(capacity, jnp.int32)
+        )
+        return genome_values.at[index].set(child_genome_by_rank[row])
+
+    genome = C.Genome(
+        g=jax.lax.fori_loop(0, B_MAX, _write_child_genome, creature.genome.g)
+    )
     zero_brain = C.BrainState.zeros(
         capacity, cfg.brain.h, state.slice.shape[1], lay.plastic_dim
     )
@@ -379,8 +448,11 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
         focal=focal,
     )
     # §3.5: the 0.02*rho_parent birth loss leaves the nutrient book; the tissue
-    # and reserve payments to the child are internal transfers.
-    birth_outflow = jnp.sum(jnp.where(success[:, None], birth_loss, 0.0), axis=0)
+    # and reserve payments to the child are internal transfers.  Only births
+    # actually performed this tick pay (deferred parents pay nothing).
+    birth_outflow = jnp.sum(
+        jnp.where(rank_in_range[:, None], birth_loss_by_rank, 0.0), axis=0
+    )
     state = update(
         state,
         entities=update(ents, creature=creature),
@@ -388,18 +460,26 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
         ledger=add_outflow(state.ledger, C.OUTFLOW_BIRTH_LOSS, birth_outflow),
     )
 
-    # Every eligible parent reports either a birth or a failure (§5.5).
+    # Every eligible parent reports exactly one event: birth, birth_fail, or
+    # birth_defer when the per-tick budget is full (C5).
     reason = jnp.where(
         ~tissue_ok,
         jnp.asarray(events.reason_code("no_tissue"), jnp.int8),
         jnp.asarray(events.reason_code("no_room"), jnp.int8),
     )
-    event_uid = jnp.where(success, child_uid, creature.identity.uid)
+    reason = jnp.where(
+        deferred, jnp.asarray(events.reason_code("none"), jnp.int8), reason
+    )
     event_kind = jnp.where(
         success,
         jnp.asarray(events.kind_code("birth"), jnp.int8),
-        jnp.asarray(events.kind_code("birth_fail"), jnp.int8),
+        jnp.where(
+            deferred,
+            jnp.asarray(events.kind_code("birth_defer"), jnp.int8),
+            jnp.asarray(events.kind_code("birth_fail"), jnp.int8),
+        ),
     )
+    event_uid = jnp.where(success, child_uid, creature.identity.uid)
     event_x = jnp.where(success, child_position[:, 0], creature.transform.pos[:, 0])
     event_y = jnp.where(success, child_position[:, 1], creature.transform.pos[:, 1])
     buffer = append_events_batch(
@@ -412,7 +492,7 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
         target_uid=creature.identity.uid,
         x=event_x,
         y=event_y,
-        success=success,
-        reason=jnp.where(success, jnp.asarray(0, jnp.int8), reason),
+        success=success | deferred,
+        reason=jnp.where(success | deferred, jnp.asarray(0, jnp.int8), reason),
     )
     return state, buffer
