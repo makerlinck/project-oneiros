@@ -154,7 +154,9 @@ def _candidate_positions(
     return positions, inside & ~occupied
 
 
-def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
+def apply(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[WorldState, events.EventBuffer]:
     """Split mature, well-fed creatures (§3.3 step 10, §5.5)."""
     creature = state.entities.creature
     return jax.lax.cond(

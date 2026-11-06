@@ -67,21 +67,26 @@ def berry_stock(state) -> float:
     return float((_array(ents.bush.edible.stock) * _array(ents.bush.alive)).sum())
 
 
-def berry_regeneration(state, cfg) -> float:
+def berry_regeneration(state, cfg, params=None) -> float:
     """Berry regeneration one environment tick produces from this state (§4.2).
 
     Mirrors environment.berry_growth exactly: the logistic increment
     rate*stock*(1-stock) + base is scaled by ramp.berry_multiplier(tick, cfg),
     then clipped to the [0, 1] stock range (so per bush the added mass is
     min(increment, 1 - stock)).  The coefficients are the M1 config values
-    cfg.world.bush_regen_rate / bush_regen_base.
+    cfg.world.bush_regen_rate / bush_regen_base, or the runtime \`params\` when a
+    batched scan supplies them.
     """
     ents = state.entities
     stock = _array(ents.bush.edible.stock)
     alive = _array(ents.bush.alive)
-    rate = float(cfg.world.bush_regen_rate)
-    base = float(cfg.world.bush_regen_base)
-    multiplier = float(ramp.berry_multiplier(state.tick, cfg))
+    if params is None:
+        rate = float(cfg.world.bush_regen_rate)
+        base = float(cfg.world.bush_regen_base)
+    else:
+        rate = float(params.bush_regen_rate)
+        base = float(params.bush_regen_base)
+    multiplier = float(ramp.berry_multiplier(state.tick, cfg, params))
     growth = (rate * stock * (1.0 - stock) + base) * multiplier
     added = np.minimum(growth, np.maximum(1.0 - stock, 0.0))
     return float((added * alive).sum())

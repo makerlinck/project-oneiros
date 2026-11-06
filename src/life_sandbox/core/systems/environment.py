@@ -70,18 +70,25 @@ NEUTRAL_TIMER_MAX: int = 90
 _EMPTY_EPS = 1e-9
 
 
-def berry_growth(arena: BushArena, tick, cfg: Config) -> BushArena:
+def berry_growth(arena: BushArena, tick, cfg: Config, params=None) -> BushArena:
     """One regeneration step for the bush stock field (§4.2, §9).
 
     The logistic increment (not the standing stock) uses the M1 calibration
-    coefficients world.bush_regen_rate / world.bush_regen_base and is scaled by
-    the startup ramp multiplier before clipping, so the ramp makes berries
-    regrow faster without changing the [0, 1] range.
+    coefficients world.bush_regen_rate / world.bush_regen_base — taken from the
+    runtime `params` when a batched scan supplies them — and is scaled by the
+    startup ramp multiplier before clipping, so the ramp makes berries regrow
+    faster without changing the [0, 1] range.
     """
     stock = arena.edible.stock
-    increment = (
-        cfg.world.bush_regen_rate * stock * (1.0 - stock) + cfg.world.bush_regen_base
-    ) * ramp.berry_multiplier(tick, cfg)
+    if params is None:
+        rate = jnp.asarray(cfg.world.bush_regen_rate, jnp.float32)
+        base = jnp.asarray(cfg.world.bush_regen_base, jnp.float32)
+    else:
+        rate = params.bush_regen_rate
+        base = params.bush_regen_base
+    increment = (rate * stock * (1.0 - stock) + base) * ramp.berry_multiplier(
+        tick, cfg, params
+    )
     grown = jnp.clip(stock + increment, 0.0, 1.0)
     stock = jnp.where(arena.alive, grown, stock)
     return update(arena, edible=update(arena.edible, stock=stock))
@@ -149,7 +156,7 @@ def carcass_rot(arena: CarcassArena) -> tuple[CarcassArena, jax.Array, jax.Array
 
 
 def toxin_composition(
-    state: WorldState, cfg: Config, key: jax.Array
+    state: WorldState, cfg: Config, key: jax.Array, params=None
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Reassigned berry composition, the chosen species and the switch flag.
 
@@ -170,7 +177,7 @@ def toxin_composition(
     n_species = base.shape[0]
     chosen = jax.random.randint(key, (), 0, n_species, dtype=jnp.int32)
     toxin = jnp.zeros((base.shape[1],), jnp.float32).at[2].set(1.0)
-    toxic_share = TOXIN_SHARE * ramp.toxin_strength(tick, cfg)  # 0.4 * alpha
+    toxic_share = TOXIN_SHARE * ramp.toxin_strength(tick, cfg, params)  # 0.4 * alpha
     toxic = (1.0 - toxic_share) * base + toxic_share * toxin[None, :]
     switched = jnp.where((jnp.arange(n_species, dtype=jnp.int32) == chosen)[:, None], toxic, base)
     return jnp.where(switch_now, switched, state.comp), chosen, switch_now
@@ -229,16 +236,18 @@ def neutral_wander(entities, cfg: Config, key: jax.Array) -> NeutralArena:
     )
 
 
-def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
+def apply(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[WorldState, events.EventBuffer]:
     """Step 2: berry growth, carcass rot, toxin schedule, neutral wander."""
     key = rng.system_key(state.key, state.tick, "environment")
     switch_key, wander_key = rng.subsplit(key, 2)
 
-    bush = bush_appearance(berry_growth(state.entities.bush, state.tick, cfg))
+    bush = bush_appearance(berry_growth(state.entities.bush, state.tick, cfg, params))
     carcass, rot_from, decomposition = carcass_rot(state.entities.carcass)
     entities = update(state.entities, bush=bush, carcass=carcass)
     entities = update(entities, neutral=neutral_wander(entities, cfg, wander_key))
-    comp, chosen, switch_now = toxin_composition(state, cfg, switch_key)
+    comp, chosen, switch_now = toxin_composition(state, cfg, switch_key, params)
 
     # Internal transfer (plant/animal -> toxin) and the mass leaving the book
     # when a carcass is removed (§3.5).

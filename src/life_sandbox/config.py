@@ -52,7 +52,7 @@ class WorldConfig:
     # calibration placeholders for M1.
     ramp_ticks: int = 0
     ramp_berry_multiplier: float = 3.0
-    ramp_metabolism_multiplier: float = 0.5
+    ramp_metabolism_multiplier: float = 0.2
     ramp_temperature_multiplier: float = 0.2
     event_capacity: int = 2048
     # Calibration placeholders: L is measured in M1 (PRINCIPLES section 7 stage 0),

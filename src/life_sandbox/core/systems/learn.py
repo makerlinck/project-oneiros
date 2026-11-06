@@ -49,7 +49,9 @@ def _modulation(slow, h):
     return jnp.einsum("npm,nm->np", slow.g, m)
 
 
-def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
+def apply(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[WorldState, events.EventBuffer]:
     if cfg.brain.kind != KIND_PLASTIC_RNN:
         return state, events.empty(cfg)
 

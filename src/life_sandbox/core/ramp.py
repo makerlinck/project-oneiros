@@ -23,34 +23,44 @@ import jax.numpy as jnp
 TOXIN_START_STRENGTH: float = 0.1
 
 
-def fraction(tick, cfg) -> jnp.ndarray:
-    """0 at the start of the ramp, 1 once the target conditions are reached."""
-    ticks = cfg.world.ramp_ticks
-    if ticks <= 0:
-        return jnp.asarray(1.0, dtype=jnp.float32)
-    return jnp.clip(jnp.asarray(tick, dtype=jnp.float32) / float(ticks), 0.0, 1.0)
+def fraction(tick, cfg, params=None) -> jnp.ndarray:
+    """0 at the start of the ramp, 1 once the target conditions are reached.
+
+    With runtime `params` the ramp length is a traced scalar, so every row of a
+    batched scan can use its own ramp_ticks (including 0 = no ramp).
+    """
+    if params is None:
+        ticks = cfg.world.ramp_ticks
+        if ticks <= 0:
+            return jnp.asarray(1.0, dtype=jnp.float32)
+        return jnp.clip(jnp.asarray(tick, dtype=jnp.float32) / float(ticks), 0.0, 1.0)
+    ticks = jnp.asarray(params.ramp_ticks, jnp.float32)
+    ramped = jnp.clip(
+        jnp.asarray(tick, dtype=jnp.float32) / jnp.maximum(ticks, 1.0), 0.0, 1.0
+    )
+    return jnp.where(ticks > 0.0, ramped, jnp.asarray(1.0, dtype=jnp.float32))
 
 
-def blend(tick, cfg, start_multiplier: float) -> jnp.ndarray:
+def blend(tick, cfg, start_multiplier: float, params=None) -> jnp.ndarray:
     """Linear blend from start_multiplier at tick 0 to 1.0 at ramp_ticks."""
     return jnp.asarray(start_multiplier, dtype=jnp.float32) + (
         1.0 - jnp.asarray(start_multiplier, dtype=jnp.float32)
-    ) * fraction(tick, cfg)
+    ) * fraction(tick, cfg, params)
 
 
-def berry_multiplier(tick, cfg) -> jnp.ndarray:
-    return blend(tick, cfg, cfg.world.ramp_berry_multiplier)
+def berry_multiplier(tick, cfg, params=None) -> jnp.ndarray:
+    return blend(tick, cfg, cfg.world.ramp_berry_multiplier, params)
 
 
-def metabolism_multiplier(tick, cfg) -> jnp.ndarray:
-    return blend(tick, cfg, cfg.world.ramp_metabolism_multiplier)
+def metabolism_multiplier(tick, cfg, params=None) -> jnp.ndarray:
+    return blend(tick, cfg, cfg.world.ramp_metabolism_multiplier, params)
 
 
-def temperature_multiplier(tick, cfg) -> jnp.ndarray:
-    return blend(tick, cfg, cfg.world.ramp_temperature_multiplier)
+def temperature_multiplier(tick, cfg, params=None) -> jnp.ndarray:
+    return blend(tick, cfg, cfg.world.ramp_temperature_multiplier, params)
 
 
-def toxin_strength(tick, cfg) -> jnp.ndarray:
+def toxin_strength(tick, cfg, params=None) -> jnp.ndarray:
     """Strength alpha of the toxic berry species: 0.1 at tick 0, 1 after the ramp.
 
     The toxic species composition is (1 - 0.4*alpha) * base + 0.4*alpha*toxin
@@ -58,4 +68,4 @@ def toxin_strength(tick, cfg) -> jnp.ndarray:
     available from the first tick; with ramp_ticks = 0 alpha is 1 (full share).
     """
     start = jnp.asarray(TOXIN_START_STRENGTH, dtype=jnp.float32)
-    return start + (1.0 - start) * fraction(tick, cfg)
+    return start + (1.0 - start) * fraction(tick, cfg, params)

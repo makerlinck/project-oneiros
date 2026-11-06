@@ -45,8 +45,14 @@ from life_sandbox.config import (
 )
 from life_sandbox.core import events as events_mod
 from life_sandbox.core import accounting
+from life_sandbox.core.params import ScanParams
 from life_sandbox.core.state import population
-from life_sandbox.core.step import run, run_batch
+from life_sandbox.core.step import (
+    compile_stats,
+    reset_compile_stats,
+    run,
+    run_batch,
+)
 from life_sandbox.world.init import initial_state
 
 A_MATURE = 100.0  # §5.2: mass reaches 1.0 after a_mature ticks of feeding
@@ -126,6 +132,145 @@ def config_from_params(params: dict) -> Config:
     )
     cfg.validate()
     return cfg
+
+
+# The bush arena is compiled once at the maximum scanned capacity; each row's
+# runtime ScanParams.bush_count masks the alive slots of the three species.
+MAX_BUSH_CAPACITY = 240
+
+
+def static_scan_config() -> Config:
+    """Structural config shared by every row of a batched M1 scan.
+
+    Only shape/interface fields live here (brain kind, sensor layout, geometry,
+    arena capacities at their maxima, event capacity).  The scanned values are
+    placeholders overwritten per row by `ScanParams`.
+    """
+    return Config.default().replaced(
+        capacities=Capacities(creature=256, bush=MAX_BUSH_CAPACITY, carcass=64, neutral=3),
+        world=WorldConfig(founders=64),
+        brain=BrainConfig(kind="plastic_rnn"),
+        learning=LearningConfig(plasticity=False, prediction=False),
+        run=RunConfig(seed=0, ticks=500, segment_ticks=64),
+    )
+
+
+def _stack(values):
+    return jax.tree.map(lambda *leaves: jnp.stack(leaves), *values)
+
+
+def measure_batched(
+    configs: list[dict],
+    seeds_per_config: list[list[int]],
+    l_ticks: int,
+    cycles: int,
+) -> dict:
+    """Run every (config, world) row in one vmap batch and group the metrics.
+
+    This is the task-21 path: the static configuration is fixed, every scanned
+    knob travels in `ScanParams` and the whole config x world batch shares one
+    compiled segment.  The returned per-config metrics use exactly the same keys
+    as `measure` so the round-1 records stay comparable.
+    """
+    base_cfg = static_scan_config()
+    rows: list[ScanParams] = []
+    states = []
+    owner: list[int] = []
+    world_of: list[int] = []
+    for config_index, (params, seeds) in enumerate(zip(configs, seeds_per_config)):
+        scan = ScanParams.from_mapping(params, base_cfg)
+        for world, seed in enumerate(seeds):
+            states.append(initial_state(base_cfg, seed=seed, params=scan))
+            rows.append(scan)
+            owner.append(config_index)
+            world_of.append(world)
+    states_batch = _stack(states)
+    params_batch = ScanParams.batched(rows)
+    batch = len(rows)
+    start_stock = np.stack(
+        [accounting.nutrient_stock(_world_state(states_batch, i)) for i in range(batch)]
+    )
+    inflow = np.zeros((batch, 2, 3), dtype=np.float64)
+    outflow = np.zeros((batch, 7, 3), dtype=np.float64)
+    transfer_from = np.zeros((batch, 3), dtype=np.float64)
+    transfer_to = np.zeros((batch, 3), dtype=np.float64)
+    counts = np.zeros((batch, len(events_mod.EVENT_KINDS)), dtype=np.int64)
+    population_rows = []
+    reset_compile_stats(clear_cache=True)
+    started = time.perf_counter()
+    for _ in range(cycles):
+        result = run_batch(states_batch, base_cfg, l_ticks, params=params_batch)
+        states_batch = result.states
+        inflow += result.inflow
+        outflow += result.outflow
+        transfer_from += result.transfer_from
+        transfer_to += result.transfer_to
+        counts += result.counts
+        population_rows.append(
+            [int(population(_world_state(states_batch, i))) for i in range(batch)]
+        )
+    wall = time.perf_counter() - started
+    stats = compile_stats()
+    end_stock = np.stack(
+        [accounting.nutrient_stock(_world_state(states_batch, i)) for i in range(batch)]
+    )
+    delta = end_stock - start_stock
+    pop = np.asarray(population_rows)  # cycles x rows
+
+    metrics = []
+    for config_index, params in enumerate(configs):
+        idx = [row for row, owner_index in enumerate(owner) if owner_index == config_index]
+        n_worlds = len(idx)
+        rows_in = inflow[idx]
+        rows_out = outflow[idx]
+        inflow_total = rows_in.sum(axis=(0, 1))  # [3] for the closure check
+        outflow_total = rows_out.sum(axis=(0, 1))
+        residual = (
+            inflow_total
+            - outflow_total
+            - delta[idx].sum(axis=0)
+            - transfer_from[idx].sum(axis=0)
+            + transfer_to[idx].sum(axis=0)
+        )
+        scale = np.maximum(
+            1.0, np.maximum(np.abs(inflow_total), np.abs(outflow_total))
+        )
+        closure = np.abs(residual) / scale
+        pop_config = pop[:, idx]
+        counts_config = counts[idx]
+        births = counts_config[:, events_mod.kind_code("birth")]
+        reseeds = counts_config[:, events_mod.kind_code("reseed")]
+        deaths = counts_config[:, events_mod.kind_code("death")]
+        capacity = int(base_cfg.capacities.creature)
+        capacity_ticks = int(np.sum(pop_config >= capacity))
+        metrics.append(
+            {
+                "seeds": list(seeds_per_config[config_index]),
+                "l_ticks": l_ticks,
+                "cycles": cycles,
+                "wall_seconds": round(wall, 2),
+                "population_final": pop_config[-1].tolist(),
+                "population_min": pop_config.min(axis=0).tolist(),
+                "population_max": pop_config.max(axis=0).tolist(),
+                "births": births.tolist(),
+                "deaths": deaths.tolist(),
+                "reseeds": reseeds.tolist(),
+                "capacity_ticks": capacity_ticks,
+                "closure_max_rel": float(np.max(closure)),
+                "ledger_inflow": rows_in.sum(axis=0).tolist(),  # [INFLOW, 3]
+                "ledger_outflow": rows_out.sum(axis=0).tolist(),  # [OUTFLOW, 3]
+                "survived": [int(value > 0) for value in pop_config[-1]],
+                "score": _score(pop_config, births, reseeds, capacity_ticks, n_worlds),
+            }
+        )
+    return {
+        "rows": metrics,
+        "batch": batch,
+        "worlds_per_config": [len(seeds) for seeds in seeds_per_config],
+        "wall_seconds": round(wall, 2),
+        "compile_stats": stats,
+        "world_ticks_per_second": round(batch * cycles * l_ticks / max(wall, 1e-9), 1),
+    }
 
 
 def sample_config(rng: random.Random, index: int) -> tuple[Config, dict]:
@@ -310,6 +455,11 @@ def main() -> None:
     parser.add_argument("--configs-file", default=None)
     parser.add_argument("--control", action="store_true", help="also run the randomize_genome control")
     parser.add_argument("--sample-mode", choices=("random", "coarse"), default="random")
+    parser.add_argument(
+        "--batched",
+        action="store_true",
+        help="round 1: run all config x world rows in one runtime-params batch",
+    )
     args = parser.parse_args()
     if not args.control:
         args.control = args.stage == "round2"
@@ -325,25 +475,100 @@ def main() -> None:
     rng = random.Random(args.seed_base + 17)
     ranked = []
     total = args.configs if args.stage == "round1" else 0
-    for index in range(total):
-        cfg, params = (
-            coarse_config(index) if args.sample_mode == "coarse" else sample_config(rng, index)
+    if args.stage == "round1" and args.batched:
+        pending = []
+        for index in range(total):
+            cfg, params = (
+                coarse_config(index)
+                if args.sample_mode == "coarse"
+                else sample_config(rng, index)
+            )
+            if index in done:
+                continue
+            pending.append((index, params))
+        seeds_per_config = [
+            [args.seed_base + index * 100 + world for world in range(args.worlds)]
+            for index, _params in pending
+        ]
+        batched = (
+            measure_batched(
+                [params for _index, params in pending],
+                seeds_per_config,
+                args.l_ticks,
+                args.cycles,
+            )
+            if pending
+            else {"rows": []}
         )
-        if index in done:
-            continue
-        seeds = [args.seed_base + index * 100 + world for world in range(args.worlds)]
-        metrics = measure(cfg, seeds, args.l_ticks, args.cycles)
-        record = {
-            "stage": args.stage,
-            "index": index,
-            "params": params,
-            "config_hash": cfg.config_hash(),
-            "metrics": metrics,
-        }
-        with records_path.open("a") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        ranked.append(record)
-        print("config", index, "score", metrics["score"], "survived", metrics["survived"], flush=True)
+        for (index, params), metrics in zip(pending, batched["rows"]):
+            cfg = config_from_params(params)
+            record = {
+                "stage": args.stage,
+                "index": index,
+                "params": params,
+                "config_hash": cfg.config_hash(),
+                "metrics": metrics,
+            }
+            with records_path.open("a") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            ranked.append(record)
+            print(
+                "config",
+                index,
+                "score",
+                metrics["score"],
+                "survived",
+                metrics["survived"],
+                flush=True,
+            )
+        if pending:
+            print(
+                "batched:",
+                json.dumps(
+                    {
+                        key: batched[key]
+                        for key in (
+                            "batch",
+                            "worlds_per_config",
+                            "wall_seconds",
+                            "compile_stats",
+                            "world_ticks_per_second",
+                        )
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+    else:
+        for index in range(total):
+            cfg, params = (
+                coarse_config(index)
+                if args.sample_mode == "coarse"
+                else sample_config(rng, index)
+            )
+            if index in done:
+                continue
+            seeds = [args.seed_base + index * 100 + world for world in range(args.worlds)]
+            metrics = measure(cfg, seeds, args.l_ticks, args.cycles)
+            record = {
+                "stage": args.stage,
+                "index": index,
+                "params": params,
+                "config_hash": cfg.config_hash(),
+                "metrics": metrics,
+            }
+            with records_path.open("a") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            ranked.append(record)
+            print(
+                "config",
+                index,
+                "score",
+                metrics["score"],
+                "survived",
+                metrics["survived"],
+                flush=True,
+            )
 
     if args.stage == "round1":
         ranked = [

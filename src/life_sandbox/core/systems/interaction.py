@@ -259,7 +259,9 @@ def _uid_of(entities: C.Entities, kind: jax.Array, slot: jax.Array) -> jax.Array
     ).astype(jnp.int32)
 
 
-def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
+def apply(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[WorldState, events.EventBuffer]:
     """Resolve one tick of drop / grab / bite interactions (§3.3 step 8, §5.4)."""
     entities = state.entities
     tick = state.tick

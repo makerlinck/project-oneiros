@@ -575,8 +575,8 @@ def test_base_metabolism_reads_body_config():
     )
 
 
-def test_metabolism_ramp_scales_only_base_demand():
-    """§9 ramp: base upkeep = 0.5x at tick 0, 1x at ramp_ticks; work is unscaled."""
+def test_metabolism_ramp_scales_whole_energy():
+    """§9 ramp: the whole energy scale is 0.5x at tick 0 and 1x at ramp_ticks."""
     cfg = ramp_cfg()
     rho = (0.2, 0.5, 0.3)
     reserves = (0.1, 0.1, 0.1)  # below the repair threshold
@@ -585,7 +585,7 @@ def test_metabolism_ramp_scales_only_base_demand():
         state = body_state(cfg, rho=rho, reserves=reserves, u_eff=(1.0, 0.0))
         state = update(state, tick=jnp.asarray(tick, jnp.int32))
         out, _ = metabolism.apply(state, cfg)
-        demand = cfg.body.base_metabolism * multiplier + movement
+        demand = (cfg.body.base_metabolism + movement) * multiplier
         drop = jnp.asarray(reserves) - out.entities.creature.body.N[0]
         assert jnp.allclose(drop, jnp.asarray(rho) * demand, atol=1e-6), tick
         assert jnp.allclose(

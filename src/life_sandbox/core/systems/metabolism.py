@@ -19,7 +19,8 @@ Implements, in this fixed order (SANDBOX.md §3.3 step 9):
              + repair (actual amount repaired this tick)
 
    All four energy terms share the single cfg.body.base_metabolism scale; only
-   the base upkeep is multiplied by m^0.75 and by the startup ramp multiplier.
+   the base upkeep is multiplied by m^0.75; the startup ramp multiplier
+   scales the whole energy scale (base + action costs), not repair.
    At the §5.3 design values and an adult (base = 0.002, m = 1) this is exactly
    the old formula (0.002, 0.0005, 0.002);
 5. toxin damage I -= 0.01*X, then X *= 0.95 (§5.1);
@@ -46,9 +47,9 @@ Documented decisions (SANDBOX.md is silent):
 - The motion part of c_tot uses the effective controls Motor.u_eff = u' (the
   noise-added, clipped outputs the motion system applied, §5.3), not the raw
   intended outputs; the bite surcharge uses the intended u_bite.
-- The startup ramp (§9) multiplies only the base upkeep term by
-  ramp.metabolism_multiplier(tick, cfg); movement, bite and repair costs are
-  physical work and are not ramped.
+- The startup ramp (§9) multiplies the whole energy scale (base upkeep plus
+  acceleration, turn and bite costs) by ramp.metabolism_multiplier(tick, cfg);
+  repair is upkeep and is not ramped.
 - The base-demand coefficient is cfg.body.base_metabolism (M1 scan): it scales
   the base upkeep and all three action costs with factors 1 / 1 / 0.25 / 1
   (acc / bite / turn), matching the §5.3 design values.  The base upkeep alone
@@ -112,7 +113,9 @@ def in_bush(entities: C.Entities) -> jax.Array:
     return jnp.any(inside, axis=1)
 
 
-def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
+def apply(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[WorldState, events.EventBuffer]:
     """Advance one tick of body physiology (SANDBOX.md §3.3 step 9)."""
     entities = state.entities
     creature = entities.creature
@@ -156,7 +159,11 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     # Motion cost uses the effective controls u' the motion system applied
     # (§5.3: "0.002*|u'_acc| ..."), not the raw intended outputs.
     u_eff = creature.motor.u_eff
-    base_metabolism = cfg.body.base_metabolism
+    base_metabolism = (
+        jnp.asarray(cfg.body.base_metabolism, jnp.float32)
+        if params is None
+        else params.base_metabolism
+    )
     # All action costs share the same energy scale (§5.3 design values: base
     # 0.002, turn 0.25*base = 0.0005, bite = base).
     movement = (
@@ -167,8 +174,8 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         + 0.25 * base_metabolism * jnp.abs(u_eff[:, 1])
         + base_metabolism * jnp.maximum(last[:, C.OUT_BITE], 0.0)
     ) * awake
-    # Base upkeep follows the physical body-mass scale m^0.75; only this term
-    # is mass-scaled and ramp-scaled (the startup ramp §9).
+    # Base upkeep follows the physical body-mass scale m^0.75.  The startup
+    # ramp (§9) scales the whole energy scale (base + action costs), not repair.
     mass_scale = jnp.power(jnp.maximum(mass, jnp.asarray(0.0, jnp.float32)), 0.75)
     base = (
         base_metabolism
@@ -176,7 +183,6 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         * (1.0 + aging_bonus)
         * jnp.where(asleep, 0.5, 1.0)
         * mass_scale
-        * ramp.metabolism_multiplier(state.tick, cfg)
     )
     # Repair only happens while integrity is strictly inside (0, 1) and
     # reserves can pay for it; I <= 0 at body entry is already dead and must
@@ -190,7 +196,9 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         jnp.minimum(REPAIR_RATE, 1.0 - body.I),
         0.0,
     )
-    demand = base + movement + repair
+    demand = (
+        (base + movement) * ramp.metabolism_multiplier(state.tick, cfg, params) + repair
+    )
     required = diet * demand[:, None]
     deficit = jnp.maximum(required - reserves, 0.0)
     reserves = jnp.maximum(reserves - required, 0.0)
@@ -204,7 +212,9 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
 
     # 6. thermogenesis and temperature damage (§5.2, §4.3).
     bush = in_bush(entities)
-    ambient = world_fields.temperature(cfg, creature.transform.pos[:, 1], state.tick, bush)
+    ambient = world_fields.temperature(
+        cfg, creature.transform.pos[:, 1], state.tick, bush, params
+    )
     temperature = body.b + 0.05 * (ambient - body.b) + 0.06 * knob * knob
     over = jnp.maximum(jnp.abs(temperature) - 1.0, 0.0) * 0.002
     heat = jnp.where(temperature > 1.0, over, 0.0)

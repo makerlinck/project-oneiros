@@ -148,6 +148,7 @@ def render(
     key: jax.Array,
     noise_base: float = VISION_BASE_NOISE,
     noise_dark: float = VISION_DARK_NOISE,
+    params=None,
 ) -> jax.Array:
     """Render the visible strip of every creature slot: float32 [N, P, 3].
 
@@ -217,7 +218,7 @@ def render(
     )
     visible = entity_hit | wall_hit
 
-    _, luminance = fields.environment_at(state, cfg)  # [N]
+    _, luminance = fields.environment_at(state, cfg, params)  # [N]
     shade = jnp.exp(-distance / ATTENUATION) * luminance[:, None]
     pixels = jnp.where(visible[..., None], colour * shade[..., None], 0.0)
 

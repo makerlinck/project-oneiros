@@ -24,6 +24,7 @@ import numpy as np
 from life_sandbox.config import Config
 from life_sandbox.core import components as C
 from life_sandbox.core import events, masks
+from life_sandbox.core.params import ScanParams
 from life_sandbox.core.state import WorldState
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems import (
@@ -54,7 +55,9 @@ SYSTEM_ORDER: tuple[str, ...] = (
     "events",
 )
 
-SystemFn = Callable[[WorldState, Config], tuple[WorldState, events.EventBuffer]]
+SystemFn = Callable[
+    [WorldState, Config, ScanParams], tuple[WorldState, events.EventBuffer]
+]
 
 SYSTEMS: tuple[tuple[str, SystemFn], ...] = (
     ("fields", fields.apply),
@@ -73,12 +76,21 @@ SYSTEMS: tuple[tuple[str, SystemFn], ...] = (
 LEDGER_FIELDS: tuple[str, ...] = ("inflow", "outflow", "transfer_from", "transfer_to", "digested")
 
 
-def step(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
-    """Advance one tick: clear the ledger, run every system in order, advance the clock."""
+def step(
+    state: WorldState, cfg: Config, params: ScanParams | None = None
+) -> tuple[WorldState, events.EventBuffer]:
+    """Advance one tick: clear the ledger, run every system in order, advance the clock.
+
+    `params` supplies the runtime M1 scan knobs; when omitted they are derived
+    from `cfg`, which keeps every existing single-configuration caller exactly
+    as before.
+    """
+    if params is None:
+        params = ScanParams.from_config(cfg)
     state = update(state, ledger=C.Ledger.zeros())
     buffer = events.empty(cfg)
     for _, system in SYSTEMS:
-        state, produced = system(state, cfg)
+        state, produced = system(state, cfg, params)
         buffer = events.concat(buffer, produced)
     state = update(state, tick=(state.tick + jnp.asarray(1, dtype=jnp.int32)).astype(jnp.int32))
     return state, buffer
@@ -93,13 +105,15 @@ def _event_counts(buffer: events.EventBuffer) -> jax.Array:
 
 
 def _scan_run(
-    state: WorldState, cfg: Config, ticks: int
+    state: WorldState, cfg: Config, ticks: int, params: ScanParams | None = None
 ) -> tuple[WorldState, jax.Array, events.EventBuffer, C.Ledger]:
     """Chunked run: K ticks compiled into one lax.scan segment (SANDBOX.md §3.3)."""
+    if params is None:
+        params = ScanParams.from_config(cfg)
 
     def body(carry, _):
         current, totals = carry
-        current, buffer = step(current, cfg)
+        current, buffer = step(current, cfg, params)
         outputs = (buffer, current.ledger)
         return (current, totals + _event_counts(buffer)), outputs
 
@@ -113,12 +127,33 @@ def _scan_run(
 DEFAULT_SEGMENT_TICKS: int = 64
 
 
+# Compilation accounting for the M1 throughput comparison: a cached segment
+# factory miss means a new XLA compilation; hits reuse the one compiled graph
+# for every configuration x world row of a batch.
+_COMPILE_STATS: dict[str, int] = {"segment": 0, "batch_segment": 0}
+
+
+def compile_stats() -> dict[str, int]:
+    """Number of compiled segment builders created in this process."""
+    return dict(_COMPILE_STATS)
+
+
+def reset_compile_stats(*, clear_cache: bool = False) -> None:
+    """Reset the counters (test hook); optionally drop the cached jitted runs."""
+    for name in _COMPILE_STATS:
+        _COMPILE_STATS[name] = 0
+    if clear_cache:
+        _compiled_segment.cache_clear()
+        _compiled_batch_segment.cache_clear()
+
+
 @functools.lru_cache(maxsize=64)
 def _compiled_segment(cfg: Config, ticks: int):
     """Jitted segment runner, cached per configuration and segment length."""
+    _COMPILE_STATS["segment"] += 1
 
-    def _run(state: WorldState):
-        return _scan_run(state, cfg, ticks)
+    def _run(state: WorldState, params: ScanParams | None = None):
+        return _scan_run(state, cfg, ticks, params)
 
     return jax.jit(_run)
 
@@ -173,23 +208,39 @@ def _merge_event_tables(target: dict[str, np.ndarray] | None, table: dict[str, n
 @functools.lru_cache(maxsize=64)
 def _compiled_batch_segment(cfg: Config, ticks: int):
     """Jitted segment runner over a batch of worlds (leading axis = world)."""
+    _COMPILE_STATS["batch_segment"] += 1
 
-    def _run(states: WorldState):
-        return _scan_run_batch(states, cfg, ticks)
+    def _run(states: WorldState, params: ScanParams | None = None):
+        return _scan_run_batch(states, cfg, ticks, params)
 
     return jax.jit(_run)
 
 
+def _batch_params(
+    cfg: Config, batch: int, params: ScanParams | None
+) -> ScanParams:
+    """Normalise runtime params to one row per world (leading axis = batch)."""
+    if params is None:
+        return ScanParams.broadcast(ScanParams.from_config(cfg), batch)
+    leaves = jax.tree.leaves(params)
+    if leaves and leaves[0].shape == ():
+        return ScanParams.broadcast(params, batch)
+    if not leaves or leaves[0].shape[0] != batch:
+        raise ValueError("batched ScanParams must have one row per state")
+    return params
+
+
 def _scan_run_batch(
-    states: WorldState, cfg: Config, ticks: int
+    states: WorldState, cfg: Config, ticks: int, params: ScanParams | None = None
 ) -> tuple[WorldState, jax.Array, events.EventBuffer, C.Ledger]:
     """Chunked run over B worlds: one scan, vmap(step) per tick (SANDBOX.md §3.3)."""
-    batched_step = jax.vmap(lambda state: step(state, cfg))
+    params = _batch_params(cfg, int(states.tick.shape[0]), params)
+    batched_step = jax.vmap(lambda state, row: step(state, cfg, row))
     batched_counts = jax.vmap(_event_counts)
 
     def body(carry, _):
         current, totals = carry
-        current, buffer = batched_step(current)
+        current, buffer = batched_step(current, params)
         return (current, totals + batched_counts(buffer)), (buffer, current.ledger)
 
     initial = jnp.zeros((len(events.EVENT_KINDS),), dtype=jnp.int32)
@@ -228,16 +279,26 @@ def run_batch(
     *,
     compile: bool = True,
     segment: int | None = None,
+    params: ScanParams | None = None,
 ) -> RunBatchResult:
     """Run B worlds together with vmap inside one lax.scan segment loop.
 
-    'states' is a batched WorldState (leading axis = world).  Per-world ledger
-    sums are kept in float64 on the host; event tables are not collected here
-    (M2 logging will stream them per segment).
+    'states' is a batched WorldState (leading axis = world); a single
+    unbatched state is accepted and promoted to a batch of one.  `params` is a
+    batched `ScanParams` (leading axis = world; a single row is broadcast);
+    with params at runtime, rows may mix different M1 scan configurations in one
+    compiled graph.  Per-world
+    ledger sums are kept in float64 on the host; event tables are not collected
+    here (M2 logging will stream them per segment).
     """
     ticks = int(ticks)
     segment = int(cfg.run.segment_ticks) if segment is None else int(segment)
+    # A single (unbatched) world is accepted and treated as a batch of one, so
+    # callers can use run_batch for any number of worlds.
+    if jnp.ndim(states.tick) == 0:
+        states = jax.tree.map(lambda leaf: jnp.expand_dims(leaf, 0), states)
     batch = int(states.tick.shape[0])
+    batch_params = _batch_params(cfg, batch, params)
     inflow = np.zeros((batch, C.N_INFLOW_CATEGORIES, C.N_NUTRIENTS), dtype=np.float64)
     outflow = np.zeros((batch, C.N_OUTFLOW_CATEGORIES, C.N_NUTRIENTS), dtype=np.float64)
     transfer_from = np.zeros((batch, C.N_NUTRIENTS), dtype=np.float64)
@@ -268,16 +329,19 @@ def run_batch(
         remaining = ticks
         while remaining > 0:
             size = min(segment, remaining)
-            states, counts_vec, buffers, ledgers = _compiled_batch_segment(cfg, size)(states)
+            states, counts_vec, buffers, ledgers = _compiled_batch_segment(cfg, size)(
+                states, batch_params
+            )
             absorb(counts_vec, ledgers, 0)
             dropped += int(np.asarray(buffers.dropped).sum())
             remaining -= size
             for world in range(batch):
                 masks.ensure_uid_headroom(states.uid_counter[world])
     else:
-        batched_step = jax.vmap(lambda state: step(state, cfg))
         for _ in range(ticks):
-            states, buffers = batched_step(states)
+            states, buffers = jax.vmap(lambda state, row: step(state, cfg, row))(
+                states, batch_params
+            )
             counts_vec = jax.vmap(_event_counts)(buffers)
             absorb(counts_vec, states.ledger, None)
             dropped += int(np.asarray(buffers.dropped).sum())
@@ -330,6 +394,7 @@ def run(
     compile: bool = True,
     segment: int | None = None,
     collect_events: bool = False,
+    params: ScanParams | None = None,
 ) -> RunResult:
     """Run ticks and return the final state, event counts, ledger totals and events.
 
@@ -340,6 +405,12 @@ def run(
     """
     ticks = int(ticks)
     segment = int(cfg.run.segment_ticks) if segment is None else int(segment)
+    single_params = ScanParams.from_config(cfg) if params is None else params
+    leaves = jax.tree.leaves(single_params)
+    if leaves and leaves[0].shape != ():
+        if leaves[0].shape != (1,):
+            raise ValueError("run() takes one ScanParams row, not a batch")
+        single_params = ScanParams.row(single_params, 0)
     totals = _zero_ledger_totals()
     counts: dict[str, int] = {}
     event_table: dict[str, np.ndarray] | None = {} if collect_events else None
@@ -355,7 +426,9 @@ def run(
         remaining = ticks
         while remaining > 0:
             size = min(int(segment), remaining)
-            state, counts_vec, buffers, ledgers = _compiled_segment(cfg, size)(state)
+            state, counts_vec, buffers, ledgers = _compiled_segment(cfg, size)(
+                state, single_params
+            )
             add_counts(counts_vec)
             _accumulate_ledger(totals, ledgers, axis=0)
             dropped += int(np.asarray(buffers.dropped).sum())
@@ -365,7 +438,7 @@ def run(
     else:
         eager_buffers: list[events.EventBuffer] = []
         for _ in range(ticks):
-            state, buffer = step(state, cfg)
+            state, buffer = step(state, cfg, single_params)
             masks.ensure_uid_headroom(state.uid_counter)
             add_counts(
                 np.asarray([events.summary(buffer).get(name, 0) for name in events.EVENT_KINDS])

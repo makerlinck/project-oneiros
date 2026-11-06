@@ -51,7 +51,7 @@ ROT_RATE: float = 0.005
 NOSE_OFFSET: float = 0.2
 
 
-def temperature(cfg: Config, y, tick, in_bush=False):
+def temperature(cfg: Config, y, tick, in_bush=False, params=None):
     """Analytic temperature field T_geo(y) + day phase - bush shade (§4.3).
 
     T_geo(y) = -2 + 4*y/height; the day term is +0.5*cos(2*pi*t/T_day); a body
@@ -65,9 +65,12 @@ def temperature(cfg: Config, y, tick, in_bush=False):
     amplitude = (
         (-2.0 + 4.0 * jnp.asarray(y, jnp.float32) / cfg.world.height) + 0.5 * phase - 0.5 * bush
     )
-    scale = ramp.temperature_multiplier(tick, cfg) * jnp.asarray(
-        cfg.world.temperature_scale, jnp.float32
+    temperature_scale = (
+        jnp.asarray(cfg.world.temperature_scale, jnp.float32)
+        if params is None
+        else params.temperature_scale
     )
+    scale = ramp.temperature_multiplier(tick, cfg, params) * temperature_scale
     return scale * amplitude
 
 
@@ -214,14 +217,21 @@ def in_bush(entities, points) -> jax.Array:
     return jnp.any(inside, axis=-1).reshape(lead)
 
 
-def environment_at(state: WorldState, cfg: Config) -> tuple[jax.Array, jax.Array]:
+def environment_at(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[jax.Array, jax.Array]:
     """Temperature and light at every creature centre (§4.3 sensor sampling)."""
     pos = state.entities.creature.transform.pos
     bush = in_bush(state.entities, pos)
-    return temperature(cfg, pos[:, 1], state.tick, bush), light(cfg, state.tick, bush)
+    return (
+        temperature(cfg, pos[:, 1], state.tick, bush, params),
+        light(cfg, state.tick, bush),
+    )
 
 
-def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
+def apply(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[WorldState, events.EventBuffer]:
     """Step 1: decay + diffuse the odour grid, then add this tick's deposits."""
     decay = jnp.asarray(1.0 - cfg.world.odor_decay, jnp.float32)
     odor = decay * diffuse(cfg, state.fields.odor) + deposit_field(cfg, state)

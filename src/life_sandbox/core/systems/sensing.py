@@ -294,6 +294,7 @@ def observe(
     cfg: Config,
     key: jax.Array,
     noise: NoiseScales = DEFAULT_NOISE,
+    params=None,
 ) -> tuple[jax.Array, jax.Array]:
     """Assemble s_t for every creature slot; also return the new pain state.
 
@@ -321,6 +322,7 @@ def observe(
         vision_key,
         noise_base=noise.vision_base,
         noise_dark=noise.vision_dark,
+        params=params,
     )
     pain, new_x, _ = pain_step(state, cfg, pain_key, noise)
 
@@ -355,7 +357,7 @@ def observe(
     heartbeat = heartbeat + _noise(heartbeat_key, (n, 1), noise.heartbeat)
     interoception = jnp.concatenate([stomach, pain, heartbeat], axis=-1)
 
-    temperature, luminance = fields.environment_at(state, cfg)
+    temperature, luminance = fields.environment_at(state, cfg, params)
     skin = (temperature - body.b)[:, None]
     skin = skin + _noise(skin_key, (n, 1), noise.skin)
     light = luminance[:, None] + _noise(light_key, (n, 1), noise.light)
@@ -381,10 +383,12 @@ def observe(
     return assembled.astype(jnp.float32), new_x
 
 
-def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
+def apply(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[WorldState, events.EventBuffer]:
     """Step 3: advance the pain carriers and write the slice for every slot."""
     key = rng.system_key(state.key, state.tick, "sense")
-    assembled, new_x = observe(state, cfg, key)
+    assembled, new_x = observe(state, cfg, key, params=params)
     creature = update(state.entities.creature, pain=update(state.entities.creature.pain, x=new_x))
     state = update(
         state,

@@ -955,6 +955,16 @@ def design_config(args) -> Config:
         learning=LearningConfig(plasticity=False, prediction=False),
         run=RunConfig(seed=0, ticks=CHUNK, segment_ticks=CHUNK),
     )
+    if args.bush_count is not None:
+        cfg = cfg.replaced(capacities=replace(cfg.capacities, bush=int(args.bush_count)))
+    if args.bush_regen_rate is not None:
+        cfg = cfg.replaced(
+            world=replace(cfg.world, bush_regen_rate=float(args.bush_regen_rate))
+        )
+    if args.ramp_metabolism is not None:
+        cfg = cfg.replaced(
+            world=replace(cfg.world, ramp_metabolism_multiplier=float(args.ramp_metabolism))
+        )
     if args.temperature_scale is not None:
         cfg = cfg.replaced(
             world=replace(
@@ -1010,6 +1020,9 @@ def main() -> None:
     parser.add_argument("--skip-bite-rate", type=float, default=0.0)
     parser.add_argument("--hunger-threshold", type=float, default=0.8)
     parser.add_argument("--stock-min", type=float, default=0.05)
+    parser.add_argument("--ramp-metabolism", type=float, default=None)
+    parser.add_argument("--bush-count", type=int, default=None)
+    parser.add_argument("--bush-regen-rate", type=float, default=None)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 

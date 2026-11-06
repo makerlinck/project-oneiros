@@ -173,7 +173,9 @@ def _follow_held(state: WorldState) -> WorldState:
     return update(state, entities=ents)
 
 
-def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
+def apply(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[WorldState, events.EventBuffer]:
     """Integrate one tick of motion (SANDBOX.md §3.3 step 6, §5.3)."""
     ents = state.entities
     creature = ents.creature

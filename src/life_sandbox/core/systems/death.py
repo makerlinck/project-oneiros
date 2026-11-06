@@ -61,7 +61,9 @@ def dead_mask(creature: C.CreatureArena) -> jax.Array:
     return creature.alive & (integrity_zero | age_cap)
 
 
-def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
+def apply(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[WorldState, events.EventBuffer]:
     """Judge deaths, spawn carcasses and release references (§3.3 step 11)."""
     ents = state.entities
     creature = ents.creature
@@ -272,7 +274,7 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     population = jnp.sum(creature_arena.alive)
     return jax.lax.cond(
         population < RESEED_THRESHOLD,
-        lambda s, b: _reseed(s, cfg, b),
+        lambda s, b: _reseed(s, cfg, b, params),
         lambda s, b: (s, b),
         state,
         buffer,
@@ -292,7 +294,7 @@ def _zero_velocity(transform: C.Transform, mask: jax.Array) -> C.Transform:
 
 
 def _reseed(
-    state: WorldState, cfg: Config, buffer: events.EventBuffer
+    state: WorldState, cfg: Config, buffer: events.EventBuffer, params=None
 ) -> tuple[WorldState, events.EventBuffer]:
     """Reseed random genomes when fewer than RESEED_THRESHOLD creatures remain.
 
@@ -316,7 +318,7 @@ def _reseed(
     key_genome, key_pos, key_theta = jax.random.split(key, 3)
     genome = world_init.random_genome(key_genome, n_seed, cfg)
     look = world_init.look_from_genome(genome, cfg)
-    body = world_init.body_from_genome(genome, cfg)
+    body = world_init.body_from_genome(genome, cfg, params)
     position = jax.random.uniform(
         key_pos,
         (n_seed, 2),

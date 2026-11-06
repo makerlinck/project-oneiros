@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from life_sandbox.brain.genome import initial_sigmas, layout as brain_layout
 from life_sandbox.config import Config
@@ -25,15 +26,22 @@ from life_sandbox.core.struct import update
 from life_sandbox.world import constants as K
 
 
-def initial_state(cfg: Config, seed: int | None = None) -> WorldState:
-    """Create the first world state for one world seed."""
+def initial_state(
+    cfg: Config, seed: int | None = None, params=None
+) -> WorldState:
+    """Create the first world state for one world seed.
+
+    `params` (a single-world `core.params.ScanParams`) supplies the runtime
+    calibration knobs: the number of alive bushes (the arena keeps the static
+    `capacities.bush` slots so states stay batchable) and founder reserves.
+    """
     cfg.validate()
     key = rng.world_key(cfg.run.seed if seed is None else seed)
     state = empty(cfg, key)
     init_key = rng.system_key(key, jnp.asarray(0, dtype=jnp.int32), "init")
     k_bush, k_founder, k_neutral, k_pain = jax.random.split(init_key, 4)
-    state = _place_bushes(state, cfg, k_bush)
-    state = _place_founders(state, cfg, k_founder)
+    state = _place_bushes(state, cfg, k_bush, params)
+    state = _place_founders(state, cfg, k_founder, params)
     state = _place_neutrals(state, cfg, k_neutral)
     state = _sample_pain_weights(state, cfg, k_pain)
     return state
@@ -90,11 +98,16 @@ def look_from_genome(genome: jax.Array, cfg: Config) -> C.Look:
     )
 
 
-def body_from_genome(genome: jax.Array, cfg: Config) -> C.Body:
+def body_from_genome(genome: jax.Array, cfg: Config, params=None) -> C.Body:
     """Adult body defaults from a genome (founders and reseeded individuals)."""
     n = genome.shape[0]
     diet = diet_from_genome(genome, cfg)
-    reserves = cfg.body.founder_reserves * diet
+    founder_reserves = (
+        jnp.asarray(cfg.body.founder_reserves, jnp.float32)
+        if params is None
+        else params.founder_reserves
+    )
+    reserves = founder_reserves * diet
     # Adult tissue follows from the growth rule: newborn 0.03 + 0.1 per grown
     # mass unit over (1.0 - 0.3) => 0.10 * c_flesh (SANDBOX.md §5.2, §5.5).
     tissue = K.ADULT_TISSUE_FRACTION * jnp.asarray(K.FLESH_COMP, dtype=jnp.float32)[None, :]
@@ -142,11 +155,24 @@ def _spectrum(kind: jax.Array, channels: int) -> jax.Array:
     return wide[kind]
 
 
-def _place_bushes(state: WorldState, cfg: Config, key: jax.Array) -> WorldState:
+def _place_bushes(
+    state: WorldState, cfg: Config, key: jax.Array, params=None
+) -> WorldState:
     capacity = cfg.capacities.bush
     per_kind = capacity // K.NUM_BUSH_KINDS
     if per_kind * K.NUM_BUSH_KINDS != capacity:
         raise ValueError("capacities.bush must divide evenly across the three bush species")
+    # Runtime bush count: the arena keeps the static (maximum) slot count and
+    # only the first n_per_kind slots of each species block are alive, so a
+    # batch can mix different bush counts without changing array shapes.
+    n_bush = capacity if params is None else int(np.asarray(params.bush_count))
+    if n_bush < 0 or n_bush > capacity:
+        raise ValueError("runtime bush_count must be in [0, capacities.bush]")
+    n_per_kind = n_bush // K.NUM_BUSH_KINDS
+    if n_per_kind * K.NUM_BUSH_KINDS != n_bush:
+        raise ValueError("runtime bush_count must divide evenly across the three species")
+    local = jnp.arange(capacity, dtype=jnp.int32) % per_kind
+    alive = local < jnp.asarray(n_per_kind, jnp.int32)
     rows, cols = cfg.world.grid_shape
     cell = cfg.world.cell
     y = (jnp.arange(rows, dtype=jnp.float32) + 0.5) * cell
@@ -176,8 +202,9 @@ def _place_bushes(state: WorldState, cfg: Config, key: jax.Array) -> WorldState:
     colors = jnp.asarray(K.BERRY_RGB, dtype=jnp.float32)[kind]
     green = jnp.asarray(K.BUSH_GREEN, dtype=jnp.float32)
     rgb = green[None, :] * (1.0 - stock)[:, None] + colors * stock[:, None]
+    stock = jnp.where(alive, stock, 0.0)
     arena = C.BushArena(
-        alive=jnp.ones(capacity, dtype=jnp.bool_),
+        alive=alive,
         uid=uids,
         transform=C.Transform(
             pos=pos,
@@ -196,7 +223,9 @@ def _place_bushes(state: WorldState, cfg: Config, key: jax.Array) -> WorldState:
     return update(state, entities=entities, uid_counter=counter)
 
 
-def _place_founders(state: WorldState, cfg: Config, key: jax.Array) -> WorldState:
+def _place_founders(
+    state: WorldState, cfg: Config, key: jax.Array, params=None
+) -> WorldState:
     capacity = cfg.capacities.creature
     n = cfg.world.founders
     margin = 2.0
@@ -232,7 +261,7 @@ def _place_founders(state: WorldState, cfg: Config, key: jax.Array) -> WorldStat
     )
     look_values = look_from_genome(genome, cfg)
     look = C.Look(rgb=_pad(look_values.rgb, capacity), odor=_pad(look_values.odor, capacity))
-    adult = body_from_genome(genome, cfg)
+    adult = body_from_genome(genome, cfg, params)
     body = C.Body(
         G=_pad(adult.G, capacity),
         N=_pad(adult.N, capacity),

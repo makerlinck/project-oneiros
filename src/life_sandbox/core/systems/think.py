@@ -106,7 +106,9 @@ def _plastic_rnn(state: WorldState, cfg: Config) -> WorldState:
     return update(state, entities=update(state.entities, creature=creature))
 
 
-def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
+def apply(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[WorldState, events.EventBuffer]:
     kind = cfg.brain.kind
     if kind == KIND_BOOTSTRAP:
         return _bootstrap(state, cfg), events.empty(cfg)

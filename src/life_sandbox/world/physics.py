@@ -246,7 +246,9 @@ def _wall_contacts_and_clip(state: WorldState, cfg: Config, pos, radius, active)
     return pos, was_clipped, contacts
 
 
-def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
+def apply(
+    state: WorldState, cfg: Config, params=None
+) -> tuple[WorldState, events.EventBuffer]:
     """Step 7: resolve overlaps, clip against the walls, record contact depth."""
     ent = state.entities
     n_creature = cfg.capacities.creature
