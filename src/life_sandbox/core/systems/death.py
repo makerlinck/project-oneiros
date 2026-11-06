@@ -272,8 +272,10 @@ def apply(
 
     # ---------------------------------------------------------------- reseed
     population = jnp.sum(creature_arena.alive)
+    limit = int(cfg.world.reseed_until_tick)
+    within_limit = (limit < 0) | (state.tick < limit)
     return jax.lax.cond(
-        population < RESEED_THRESHOLD,
+        (population < RESEED_THRESHOLD) & within_limit,
         lambda s, b: _reseed(s, cfg, b, params),
         lambda s, b: (s, b),
         state,
@@ -303,9 +305,6 @@ def _reseed(
     Diagnostics can disable the emergency rescue with world.reseed_enabled.
     """
     if not cfg.world.reseed_enabled:
-        return state, buffer
-    limit = int(cfg.world.reseed_until_tick)
-    if limit >= 0 and int(state.tick) >= limit:
         return state, buffer
     creature = state.entities.creature
     capacity = creature.alive.shape[0]

@@ -87,7 +87,10 @@ def berry_regeneration(state, cfg, params=None) -> float:
         rate = float(params.bush_regen_rate)
         base = float(params.bush_regen_base)
     multiplier = float(ramp.berry_multiplier(state.tick, cfg, params))
-    growth = (rate * stock * (1.0 - stock) + base) * multiplier
+    nut = float(cfg.world.bush_regen_nut_multiplier)
+    kinds = _array(ents.bush.edible.kind)
+    factor = np.where(kinds == 2, nut, 1.0)
+    growth = (rate * stock * (1.0 - stock) + base) * factor * multiplier
     added = np.minimum(growth, np.maximum(1.0 - stock, 0.0))
     return float((added * alive).sum())
 

@@ -16,6 +16,7 @@ per tick but must produce the same float64 ledger totals.
 from __future__ import annotations
 
 import types
+from dataclasses import replace
 
 import jax.numpy as jnp
 import numpy as np
@@ -550,3 +551,33 @@ def test_birth_ledger():
     assert float(jnp.sum(out.ledger.inflow)) == 0.0
     books = accounting.nutrient_books(state, out, result_from_ledger(out.ledger))
     assert books.closed, books
+
+
+def test_reseed_until_tick_stops_rescue_after_the_limit():
+    """jit path: reseeds happen before the limit and stop after it."""
+    cfg = small_cfg()
+    cfg = replace(cfg, world=replace(cfg.world, reseed_until_tick=5))
+    result = run(initial_state(cfg), cfg, 20, collect_events=True)
+    mask = result.events["kind"] == events.kind_code("reseed")
+    ticks = result.events["tick"][mask]
+    assert ticks.size > 0
+    assert int(np.max(ticks)) < 5
+
+
+def test_berry_regeneration_nut_multiplier_mirrors_environment():
+    """The berry mirror applies bush_regen_nut_multiplier to nut species (kind 2)."""
+    cfg = small_cfg()
+    start = _bite_world(cfg)
+    bush = start.entities.bush
+    kind = bush.edible.kind.at[0].set(2)
+    start = update(
+        start,
+        entities=update(
+            start.entities,
+            bush=update(bush, edible=update(bush.edible, kind=kind)),
+        ),
+    )
+    cfg = replace(cfg, world=WorldConfig(founders=2, bush_regen_nut_multiplier=2.0))
+    env_out, _ = environment.apply(start, cfg)
+    added = accounting.berry_stock(env_out) - accounting.berry_stock(start)
+    assert accounting.berry_regeneration(start, cfg) == pytest.approx(added, abs=1e-7)

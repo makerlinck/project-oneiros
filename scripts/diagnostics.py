@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import time
 from collections import Counter
 from dataclasses import replace
@@ -1044,6 +1045,22 @@ def summarize(cfg, result, seeds, cohort_len: int, chunk: int = CHUNK) -> dict:
     }
 
 
+def git_provenance() -> dict:
+    """Commit and dirty flag for the report (provenance)."""
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain"], text=True, stderr=subprocess.DEVNULL
+            ).strip()
+        )
+        return {"commit": commit, "dirty": dirty}
+    except Exception:
+        return {"commit": None, "dirty": None}
+
+
 def design_config(args) -> Config:
     if args.tiny:
         capacities = Capacities(creature=16, bush=6, carcass=2, neutral=1)
@@ -1207,6 +1224,7 @@ def main() -> None:
     }
     summary["seeds"] = seeds
     summary["ticks"] = args.ticks
+    summary["provenance"] = git_provenance()
     summary["wall_seconds"] = result["wall_seconds"]
     out = Path(args.out or ("runs/diagnostics/" + args.arm + ".json"))
     out.parent.mkdir(parents=True, exist_ok=True)

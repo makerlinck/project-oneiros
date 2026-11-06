@@ -746,7 +746,7 @@ fork(snapshot, patches, n_ticks) → (treated_run, control_run)
 | M4 干预与分析库 | fork、patch、配对分析，生成标准报告 | 空 patch 的 fork 与对照逐位相同 |
 | M5 社会与信号 | altricial 模式；声音场 | 按预注册 |
 
-**起步爬坡：** 随机初始化的创始个体很可能马上灭绝。前 `ramp_ticks` 个 tick 里，让世界从宽松状态线性过渡到目标参数：浆果再生 × `ramp_berry_multiplier`（默认 3）→ 1，**整个能量尺度**（基础代谢 + 加速/转向/咬的动作代价，修复项除外）× `ramp_metabolism_multiplier`（默认 0.2）→ 1，温差幅度 × `ramp_temperature_multiplier`（默认 0.2）→ 1，含毒浆果的毒素替换倍率 α 从 0.1 → 1（毒性切换时间表在爬坡期照常运行，含 tick 0）。这里只调整环境条件，不设计行为。
+**起步爬坡：** 随机初始化的创始个体很可能马上灭绝。前 `ramp_ticks` 个 tick 里，让世界从宽松状态线性过渡到目标参数：浆果再生 × `ramp_berry_multiplier`（默认 3）→ 1，**整个能量尺度**（基础代谢 + 加速/转向/咬的动作代价，修复项除外）× `ramp_metabolism_multiplier`（默认 0.1）→ 1，温差幅度 × `ramp_temperature_multiplier`（默认 0.2）→ 1，含毒浆果的毒素替换倍率 α 从 0.1 → 1（毒性切换时间表在爬坡期照常运行，含 tick 0）。这里只调整环境条件，不设计行为。
 
 ---
 
