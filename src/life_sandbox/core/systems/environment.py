@@ -19,12 +19,15 @@ What one tick does, in this fixed order:
    outflow[OUTFLOW_DECOMPOSITION], so the dead slot never silently drops mass.
 3. Toxin schedule (§4.4): every T_switch = c_switch * L ticks (L = world.l_ticks,
    an M1 calibration output) the environment key picks one berry species; its
-   composition becomes 0.6 * base + 0.4 * toxin and every other species returns
-   to the base composition.  The switch event carries the species index in the
-   x field (the event buffer has no dedicated column).  Appearance and odour do
-   not change: only the consequences differ (§4.3).  While the startup ramp is
-   still running (ramp.toxin_active is false, §9) no switch happens and comp is
-   reset to INITIAL_COMP every tick, so berries carry no toxin.
+   composition becomes (1 - 0.4*alpha) * base + 0.4*alpha * (0, 0, 1) and every
+   other species returns to the base composition, where
+   alpha = ramp.toxin_strength(tick, cfg) (§9).  The schedule runs from tick 0
+   and through the whole startup ramp; alpha only weakens the toxic share
+   (0.1 at tick 0 -> 1 after ramp_ticks) instead of removing it, so the toxin
+   nutrient is available from the first tick and no individual is chronically
+   toxin-deficient.  The switch event carries the species index in the x field
+   (the event buffer has no dedicated column).  Appearance and odour do not
+   change: only the consequences differ (§4.3).
 4. Neutral objects (§4.5): scripted wander.  The browser only specifies a random
    walk, so the parameters below are local choices: speed 0.08 units/tick and a
    new random heading every 30-90 ticks, reflecting off the walls.
@@ -150,24 +153,27 @@ def toxin_composition(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Reassigned berry composition, the chosen species and the switch flag.
 
-    During the startup ramp the schedule is off and the composition is pinned to
-    INITIAL_COMP (no toxin) every tick (§9); once ramp.toxin_active is true the
-    normal §4.4 schedule resumes.
+    The switch schedule runs normally from tick 0 and throughout the startup
+    ramp; only the toxic share is weakened by
+    alpha = ramp.toxin_strength(tick, cfg) (§9, rule fix from the 2026-11-06
+    review): the chosen species becomes
+    (1 - 0.4*alpha) * base + 0.4*alpha * (0, 0, 1).  On non-switch ticks the
+    previous composition is kept unchanged.  With ramp_ticks = 0 alpha is 1 and
+    the composition is the full 0.6*base + 0.4*toxin of §4.4.
     """
     period = max(1, int(round(float(cfg.world.c_switch) * float(cfg.world.l_ticks))))
     tick = state.tick
-    active = ramp.toxin_active(tick, cfg)
-    switch_now = (tick > 0) & (jnp.mod(tick, jnp.asarray(period, jnp.int32)) == 0) & active
+    # Tick 0 is a period multiple: the first tick itself picks a toxic species.
+    switch_now = jnp.mod(tick, jnp.asarray(period, jnp.int32)) == 0
 
     base = jnp.asarray(INITIAL_COMP, jnp.float32)
     n_species = base.shape[0]
     chosen = jax.random.randint(key, (), 0, n_species, dtype=jnp.int32)
     toxin = jnp.zeros((base.shape[1],), jnp.float32).at[2].set(1.0)
-    toxic = 0.6 * base + TOXIN_SHARE * toxin[None, :]
+    toxic_share = TOXIN_SHARE * ramp.toxin_strength(tick, cfg)  # 0.4 * alpha
+    toxic = (1.0 - toxic_share) * base + toxic_share * toxin[None, :]
     switched = jnp.where((jnp.arange(n_species, dtype=jnp.int32) == chosen)[:, None], toxic, base)
-    comp = jnp.where(switch_now, switched, state.comp)
-    comp = jnp.where(active, comp, base)
-    return comp, chosen, switch_now
+    return jnp.where(switch_now, switched, state.comp), chosen, switch_now
 
 
 def neutral_wander(entities, cfg: Config, key: jax.Array) -> NeutralArena:

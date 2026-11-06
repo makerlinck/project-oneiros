@@ -16,7 +16,7 @@ import pytest
 
 from life_sandbox.config import Capacities, Config, RunConfig, WorldConfig
 from life_sandbox.core import components as C
-from life_sandbox.core import events, rng
+from life_sandbox.core import events, ramp, rng
 from life_sandbox.core.state import empty
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems import environment
@@ -188,29 +188,34 @@ def test_carcass_is_removed_when_empty():
 
 
 def test_toxin_schedule_switches_every_period():
-    cfg = make_cfg(l_ticks=10.0, c_switch=1.0)
+    cfg = make_cfg(l_ticks=10.0, c_switch=1.0)  # period 10
     state = at_tick(state_of(cfg), 0)
+
+    # Tick 0 is a period multiple: the first tick already picks a toxic species.
     out, buffer = environment.apply(state, cfg)
-    assert int(buffer.count) == 0
-    assert np.allclose(np.asarray(out.comp), BASE, atol=1e-7)
-
-    out, buffer = environment.apply(at_tick(out, 9), cfg)
-    assert int(buffer.count) == 0
-    assert np.allclose(np.asarray(out.comp), BASE, atol=1e-7)
-
-    switched, buffer = environment.apply(at_tick(out, 10), cfg)
     assert int(buffer.count) == 1
-    summary = events.summary(buffer)
-    assert summary == {"toxin_switch": 1}
+    assert events.summary(buffer) == {"toxin_switch": 1}
     chosen = int(buffer.uid[0])
     assert 0 <= chosen < BASE.shape[0]
     assert float(buffer.x[0]) == pytest.approx(float(chosen))
-    assert int(buffer.tick[0]) == 10
-    comp = np.asarray(switched.comp)
-    toxic = 0.6 * BASE + 0.4 * np.asarray([0.0, 0.0, 1.0])
+    assert int(buffer.tick[0]) == 0
+    comp = np.asarray(out.comp)
+    toxic = 0.6 * BASE + 0.4 * np.asarray([0.0, 0.0, 1.0])  # ramp_ticks = 0 -> alpha = 1
     for species in range(BASE.shape[0]):
         expected = toxic[species] if species == chosen else BASE[species]
         assert np.allclose(comp[species], expected, atol=1e-7)
+
+    # Non-multiple ticks keep the composition and emit no event.
+    kept, buffer = environment.apply(at_tick(out, 9), cfg)
+    assert int(buffer.count) == 0
+    assert np.array_equal(np.asarray(kept.comp), comp)
+
+    # The next period multiple switches again at the full strength.
+    switched, buffer = environment.apply(at_tick(out, 10), cfg)
+    assert events.summary(buffer) == {"toxin_switch": 1}
+    assert int(buffer.tick[0]) == 10
+    comp = np.asarray(switched.comp)
+    assert np.allclose(comp[:, 2].max(), 0.4, atol=1e-7)
 
 
 def test_toxin_schedule_uses_the_c_switch_factor():
@@ -447,29 +452,87 @@ def test_ramp_boosts_berry_regeneration():
         assert late_stock[slot] == pytest.approx(min(1.0, start + increment), abs=1e-7)
 
 
-def test_ramp_blocks_the_toxin_switch_and_keeps_berries_nontoxic():
-    # Period 4 is shorter than the 10-tick ramp, so a switch would otherwise
-    # fire at ticks 4 and 8.
-    cfg = make_cfg(ramp_ticks=10, l_ticks=4.0, c_switch=1.0)
+def test_toxin_strength_ramps_from_ten_percent():
+    plain = make_cfg()  # ramp_ticks = 0 -> full strength everywhere
+    ramped = make_cfg(ramp_ticks=10)
+    for tick in (0, 5, 10, 500):
+        assert float(ramp.toxin_strength(tick, plain)) == pytest.approx(1.0, abs=1e-6)
+    # alpha = 0.1 + 0.9 * fraction (§9 rule fix: never zero)
+    for tick, expected in ((0, 0.1), (5, 0.55), (10, 1.0), (20, 1.0)):
+        assert float(ramp.toxin_strength(tick, ramped)) == pytest.approx(expected, abs=1e-6)
+
+
+def _toxic_species(comp: np.ndarray) -> int:
+    rows = np.nonzero(comp[:, 2] > 0.0)[0]
+    assert len(rows) == 1, comp
+    return int(rows[0])
+
+
+def test_toxin_share_follows_the_ramp_strength():
+    # Period 5: switches at ticks 0, 5 and 10, i.e. at ramp fractions 0, 0.5, 1.
+    cfg = make_cfg(ramp_ticks=10, l_ticks=5.0, c_switch=1.0)
     state = state_of(cfg)
-    poisoned = np.asarray(INITIAL_COMP).copy()
-    poisoned[0] = [0.51, 0.09, 0.40]
-    state = update(state, comp=jnp.asarray(poisoned, jnp.float32))
-
-    for tick in (0, 4, 8):
+    for tick, expected_share in ((0, 0.04), (5, 0.22), (10, 0.4)):
         out, buffer = environment.apply(at_tick(state, tick), cfg)
-        assert int(buffer.count) == 0, tick
-        assert np.allclose(np.asarray(out.comp), BASE, atol=1e-7), tick  # no toxin
+        assert events.summary(buffer) == {"toxin_switch": 1}, tick
+        comp = np.asarray(out.comp)
+        species = _toxic_species(comp)
+        assert comp[species, 2] == pytest.approx(expected_share, abs=1e-7), tick
+        expected = (1.0 - expected_share) * BASE[species] + expected_share * np.asarray(
+            [0.0, 0.0, 1.0]
+        )
+        assert comp[species].tolist() == pytest.approx(expected.tolist(), abs=1e-7)
+        for other in range(BASE.shape[0]):
+            if other != species:
+                assert np.allclose(comp[other], BASE[other], atol=1e-7), (tick, other)
 
-    # The ramp is over at tick 10; the next period multiple switches normally.
-    out, buffer = environment.apply(at_tick(state, 12), cfg)
+
+def test_non_switch_ticks_keep_the_current_composition():
+    cfg = make_cfg(ramp_ticks=10, l_ticks=5.0, c_switch=1.0)
+    switched, buffer = environment.apply(at_tick(state_of(cfg), 5), cfg)
     assert events.summary(buffer) == {"toxin_switch": 1}
-    chosen = int(buffer.uid[0])
-    toxic = 0.6 * BASE + 0.4 * np.asarray([0.0, 0.0, 1.0])
+    kept, buffer = environment.apply(at_tick(switched, 7), cfg)
+    assert int(buffer.count) == 0
+    assert np.array_equal(np.asarray(kept.comp), np.asarray(switched.comp))
+    # tick 10 is a multiple again and refreshes the composition at alpha = 1
+    refreshed, buffer = environment.apply(at_tick(kept, 10), cfg)
+    assert events.summary(buffer) == {"toxin_switch": 1}
+    assert float(np.asarray(refreshed.comp)[:, 2].max()) == pytest.approx(0.4, abs=1e-7)
+
+
+def test_ramp_zero_keeps_the_full_toxin_share():
+    cfg = make_cfg(ramp_ticks=0, l_ticks=5.0, c_switch=1.0)
+    for tick in (0, 5, 10):
+        assert float(ramp.toxin_strength(tick, cfg)) == pytest.approx(1.0, abs=1e-6)
+        out, buffer = environment.apply(at_tick(state_of(cfg), tick), cfg)
+        assert events.summary(buffer) == {"toxin_switch": 1}
+        comp = np.asarray(out.comp)
+        species = _toxic_species(comp)
+        old_style = 0.6 * BASE[species] + 0.4 * np.asarray([0.0, 0.0, 1.0])
+        assert comp[species].tolist() == pytest.approx(old_style.tolist(), abs=1e-7)
+
+
+def test_toxin_availability_is_reduced_across_the_ramp():
+    # Period 1: the composition is refreshed every tick, so the toxic share can
+    # be read as a time series.  The ramp weakens the toxin nutrient instead of
+    # removing it (no chronic toxin deficiency, 2026-11-06 review problem 7).
+    cfg = make_cfg(ramp_ticks=10, l_ticks=1.0, c_switch=1.0)
+    shares = []
+    for tick in range(10):
+        out, _ = environment.apply(at_tick(state_of(cfg), tick), cfg)
+        comp = np.asarray(out.comp)
+        shares.append(float(comp[_toxic_species(comp), 2]))
+    expected = [0.4 * (0.1 + 0.9 * (tick / 10.0)) for tick in range(10)]
+    assert shares == pytest.approx(expected, abs=1e-7)
+    # Mean share over the ramp is 0.4 * mean(alpha) = 0.4 * 0.505, about half
+    # of the full-strength share; it is never zero.
+    assert float(np.mean(shares)) == pytest.approx(0.4 * 0.505, abs=1e-6)
+    assert 0.0 < float(np.mean(shares)) < 0.6 * 0.4
+
+    # The full share is back once the ramp is over.
+    out, _ = environment.apply(at_tick(state_of(cfg), 10), cfg)
     comp = np.asarray(out.comp)
-    for species in range(BASE.shape[0]):
-        expected = toxic[species] if species == chosen else BASE[species]
-        assert np.allclose(comp[species], expected, atol=1e-7), species
+    assert float(comp[_toxic_species(comp), 2]) == pytest.approx(0.4, abs=1e-7)
 
 
 def test_ramped_apply_traces_under_jit():
@@ -487,9 +550,15 @@ def test_ramped_apply_traces_under_jit():
     eager, eager_buffer = environment.apply(state, cfg)
     compiled = jax.jit(environment.apply, static_argnums=(1,))
     out, buffer = compiled(state, cfg)
-    assert int(eager_buffer.count) == 0
-    assert int(buffer.count) == 0
-    assert np.allclose(np.asarray(out.comp), BASE, atol=1e-7)
+    assert int(eager_buffer.count) == 1
+    assert int(buffer.count) == 1
+    assert events.summary(buffer) == {"toxin_switch": 1}
+    # Tick 4 of a 10-tick ramp: alpha = 0.1 + 0.9 * 0.4 = 0.46, so the toxic
+    # species carries 0.4 * 0.46 = 0.184 of the toxin nutrient.
+    expected_share = 0.4 * (0.1 + 0.9 * 0.4)
+    comp = np.asarray(out.comp)
+    assert float(comp[_toxic_species(comp), 2]) == pytest.approx(expected_share, abs=1e-6)
+    assert np.allclose(np.asarray(out.comp), np.asarray(eager.comp), atol=1e-9)
     assert np.allclose(
         np.asarray(out.entities.bush.edible.stock),
         np.asarray(eager.entities.bush.edible.stock),

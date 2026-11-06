@@ -10,7 +10,18 @@ Implements, in this fixed order (SANDBOX.md §3.3 step 9):
    eps_j = 0.9*rho_j^gamma and N_cap,j = rho_j; overflow leaves the book;
    unabsorbed plant/animal matter is excreted, unabsorbed toxin becomes X with
    kappa_tox = 3;
-4. metabolic demand (§5.3) split by rho, then deficiency damage I -= 5*sum(d_j);
+4. metabolic demand (§5.3) split by rho, then deficiency damage I -= 5*sum(d_j):
+
+       c_tot = base*(1 + 3k^2)*(1 + aging)*(sleep? 0.5 : 1) * m^0.75
+             + base*|u_acc'|*(1 + k)*(m + m_held)
+             + 0.25*base*|u_turn'|
+             + base*max(0, u_bite)
+             + repair (actual amount repaired this tick)
+
+   All four energy terms share the single cfg.body.base_metabolism scale; only
+   the base upkeep is multiplied by m^0.75 and by the startup ramp multiplier.
+   At the §5.3 design values and an adult (base = 0.002, m = 1) this is exactly
+   the old formula (0.002, 0.0005, 0.002);
 5. toxin damage I -= 0.01*X, then X *= 0.95 (§5.1);
 6. thermogenesis b += 0.05*(T - b) + 0.06*k^2; |b| > 1 damages I (§5.2);
 7. growth toward mu = 1: at most 0.7/a_mature mass per tick, paying
@@ -38,8 +49,11 @@ Documented decisions (SANDBOX.md is silent):
 - The startup ramp (§9) multiplies only the base upkeep term by
   ramp.metabolism_multiplier(tick, cfg); movement, bite and repair costs are
   physical work and are not ramped.
-- The base-demand coefficient is cfg.body.base_metabolism (M1 scan); the same
-  coefficient scales the |u_acc'| movement term (§5.3 uses one 0.002 there).
+- The base-demand coefficient is cfg.body.base_metabolism (M1 scan): it scales
+  the base upkeep and all three action costs with factors 1 / 1 / 0.25 / 1
+  (acc / bite / turn), matching the §5.3 design values.  The base upkeep alone
+  is multiplied by m^0.75 (physical body scale) and by the ramp multiplier;
+  the repair charge stays REPAIR_RATE (the actual repaired amount).
 - Growth is all-or-nothing per tick: if any component of 0.1*delta_m*c_flesh
   is unavailable, the tick adds no mass.
 - "inside a bush" for shading is the centre within the bush radius; temperature
@@ -143,21 +157,25 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     # (§5.3: "0.002*|u'_acc| ..."), not the raw intended outputs.
     u_eff = creature.motor.u_eff
     base_metabolism = cfg.body.base_metabolism
+    # All action costs share the same energy scale (§5.3 design values: base
+    # 0.002, turn 0.25*base = 0.0005, bite = base).
     movement = (
         base_metabolism
         * jnp.abs(u_eff[:, 0])
         * (1.0 + knob)
         * (mass + m_held)
-        + 0.0005 * jnp.abs(u_eff[:, 1])
-        + 0.002 * jnp.maximum(last[:, C.OUT_BITE], 0.0)
+        + 0.25 * base_metabolism * jnp.abs(u_eff[:, 1])
+        + base_metabolism * jnp.maximum(last[:, C.OUT_BITE], 0.0)
     ) * awake
-    # Startup ramp (§9): only the base demand is scaled, never the movement,
-    # bite or repair surcharges (those are physical work, not upkeep).
+    # Base upkeep follows the physical body-mass scale m^0.75; only this term
+    # is mass-scaled and ramp-scaled (the startup ramp §9).
+    mass_scale = jnp.power(jnp.maximum(mass, jnp.asarray(0.0, jnp.float32)), 0.75)
     base = (
         base_metabolism
         * (1.0 + KNOB_ENERGY_COEFF * knob * knob)
         * (1.0 + aging_bonus)
         * jnp.where(asleep, 0.5, 1.0)
+        * mass_scale
         * ramp.metabolism_multiplier(state.tick, cfg)
     )
     # Repair only happens while integrity is strictly inside (0, 1) and

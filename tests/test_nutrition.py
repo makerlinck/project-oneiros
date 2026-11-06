@@ -411,7 +411,8 @@ def test_growth_payment():
     body = out.entities.creature.body
     shape = out.entities.creature.shape
     delta_mass = 0.7 / 100.0
-    demand = cfg.body.base_metabolism  # base only: I = 1 -> no repair
+    # Base upkeep now scales with the body mass: m^0.75 at m = 0.3.
+    demand = cfg.body.base_metabolism * (0.3 ** 0.75)  # I = 1 -> no repair
     cost = 0.1 * delta_mass * FLESH
     capped = jnp.minimum(jnp.asarray(reserves), jnp.asarray(rho))
     expected_n = capped - jnp.asarray(rho) * demand - cost
@@ -707,3 +708,94 @@ def test_metabolism_ramp_does_not_scale_repair():
     drop = jnp.asarray(reserves) - out.entities.creature.body.N[0]
     assert jnp.allclose(drop, jnp.asarray(rho) * demand, atol=1e-6)
     assert float(out.entities.creature.body.I[0]) == pytest.approx(0.502, abs=1e-6)
+
+
+def _demand_of(cfg, *, rho=(0.2, 0.5, 0.3), mass=1.0, maturity=1.0, u_eff=None,
+                bite=0.0, reserves=(0.05, 0.05, 0.05), integrity=1.0):
+    """Total c_tot this tick, read back from the reserve drop (split by rho)."""
+    last = jnp.zeros((N, C.N_OUTPUTS), jnp.float32)
+    if bite:
+        last = last.at[0, C.OUT_BITE].set(bite)
+    state = body_state(
+        cfg,
+        rho=rho,
+        reserves=reserves,
+        mass=mass,
+        maturity=maturity,
+        integrity=integrity,
+        last_out=last,
+        u_eff=u_eff,
+    )
+    out, _ = metabolism.apply(state, cfg)
+    drop = jnp.asarray(reserves) - out.entities.creature.body.N[0]
+    # A juvenile also pays growth tissue from N; remove that known cost so the
+    # measured drop reflects c_tot only (demand is split by rho).
+    growth_cost = jnp.zeros(3, jnp.float32)
+    if mass < 1.0:
+        delta_mass = min(0.7 / 100.0, 1.0 - mass)
+        growth_cost = 0.1 * delta_mass * FLESH
+    demand = (drop - growth_cost) / jnp.asarray(rho)
+    assert jnp.allclose(demand, demand[0], atol=1e-7)
+    ledger = out.ledger.outflow[C.OUTFLOW_METABOLISM]
+    assert jnp.allclose(ledger, jnp.asarray(rho) * demand[0], atol=1e-6)
+    return float(demand[0])
+
+
+def test_demand_terms_match_the_old_formula_at_adult_default():
+    """Default cfg + adult: base 0.002, turn 0.25*base, bite = base (§5.3)."""
+    cfg = small_cfg()
+    base = cfg.body.base_metabolism
+    assert _demand_of(cfg) == pytest.approx(float(base), abs=1e-7)
+    assert _demand_of(cfg, u_eff=(1.0, 0.0)) == pytest.approx(float(2.0 * base), abs=1e-7)
+    assert _demand_of(cfg, u_eff=(0.0, 1.0)) == pytest.approx(
+        float(base + 0.25 * base), abs=1e-7
+    )
+    assert _demand_of(cfg, bite=1.0) == pytest.approx(float(2.0 * base), abs=1e-7)
+    assert _demand_of(cfg, u_eff=(1.0, 1.0), bite=1.0) == pytest.approx(
+        float(base * (1.0 + 1.0 + 0.25 + 1.0)), abs=1e-7
+    )
+
+
+def test_base_metabolism_scales_all_terms_five_x():
+    """A 5x cfg.body.base_metabolism scales all four demand terms together."""
+    cfg = small_cfg().replaced(body=BodyConfig(base_metabolism=0.01))
+    base = cfg.body.base_metabolism
+    assert base == pytest.approx(5.0 * 0.002)
+    assert _demand_of(cfg) == pytest.approx(float(base), abs=1e-7)
+    assert _demand_of(cfg, u_eff=(1.0, 0.0)) == pytest.approx(float(2.0 * base), abs=1e-7)
+    assert _demand_of(cfg, u_eff=(0.0, 1.0)) == pytest.approx(
+        float(base + 0.25 * base), abs=1e-7
+    )
+    assert _demand_of(cfg, bite=1.0) == pytest.approx(float(2.0 * base), abs=1e-7)
+    assert _demand_of(cfg, u_eff=(1.0, 1.0), bite=1.0) == pytest.approx(
+        float(base * 3.25), abs=1e-7
+    )
+    # Repair still charges the actual repaired amount (REPAIR_RATE), not 5x.
+    repair_demand = _demand_of(cfg, reserves=(0.2, 0.2, 0.2), integrity=0.5)
+    assert repair_demand == pytest.approx(
+        float(base + metabolism.REPAIR_RATE), abs=1e-7
+    )
+
+
+def test_juvenile_demand_uses_mass_power_075():
+    """Base upkeep scales as m^0.75; the acceleration term uses (m + m_held)."""
+    cfg = small_cfg()
+    base = cfg.body.base_metabolism
+    mass = 0.3
+    mass_scale = mass ** 0.75
+    assert mass_scale == pytest.approx(0.405, abs=1e-3)
+
+    # Base term alone: exactly m^0.75 of the adult value (1e-6 tolerance).
+    base_only = _demand_of(cfg, mass=mass, maturity=0.0)
+    assert base_only == pytest.approx(float(base * mass_scale), abs=1e-6)
+
+    # Acceleration term carries (m + m_held) = 0.3, on top of the m^0.75 base.
+    moving = _demand_of(cfg, mass=mass, maturity=0.0, u_eff=(1.0, 0.0))
+    assert moving == pytest.approx(float(base * (mass_scale + mass)), abs=1e-6)
+
+    everything = _demand_of(
+        cfg, mass=mass, maturity=0.0, u_eff=(1.0, 1.0), bite=1.0
+    )
+    assert everything == pytest.approx(
+        float(base * (mass_scale + mass + 0.25 + 1.0)), abs=1e-6
+    )
