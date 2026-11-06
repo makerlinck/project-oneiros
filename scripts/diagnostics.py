@@ -39,6 +39,7 @@ from life_sandbox.core.step import SYSTEMS, _event_counts, step as engine_step
 from life_sandbox.core.systems import reproduction as reproduction_system
 from life_sandbox.core.systems.metabolism import R_DIG
 from life_sandbox.analysis import probe
+from life_sandbox.analysis import summary as analysis_summary
 from life_sandbox.core.struct import update
 from life_sandbox.world.init import diet_from_genome, initial_state
 
@@ -56,6 +57,7 @@ PIN_BUSH_STOCK = False
 SKIP_BITE_RATE = 0.0
 HUNGER_THRESHOLD = 0.8
 STOCK_MIN = 0.05
+SNAPSHOTS = False
 PINNED_BUSH_SLOTS = jnp.zeros((0,), dtype=jnp.int32)
 PINNED_POS = None
 PINNED_THETA = None
@@ -378,6 +380,7 @@ def _flatten(buffers, world: int) -> dict:
         "loss",
         "parent_uid",
         "absorbed",
+        "dn",
     ):
         columns[name] = np.asarray(getattr(buffers, name))[:, world][mask]
     return columns
@@ -495,16 +498,21 @@ def run_worlds(
                     (columns["target_kind"] == C.CREATURE)
                     | (columns["target_kind"] == C.CARCASS)
                 )
-                for uid, target_kind, absorbed in zip(
+                living_events = []
+                for uid, target_kind, dn in zip(
                     columns["uid"][living].tolist(),
                     columns["target_kind"][living].tolist(),
-                    columns["absorbed"][living].tolist(),
+                    columns["dn"][living].tolist(),
                 ):
                     if int(target_kind) == C.CREATURE:
                         worlds[world]["bites_living"][int(uid)] += 1
-                    worlds[world]["meat_animal"][int(uid)] += float(
-                        np.asarray(absorbed)[C.ANIMAL]
+                    living_events.append(
+                        {"uid": int(uid), "target_kind": int(target_kind), "dn": dn}
                     )
+                for uid, mass in analysis_summary.meat_intake_by_actor(
+                    living_events
+                ).items():
+                    worlds[world]["meat_animal"][uid] += mass
                 reseed_events = columns["kind"] == events_mod.kind_code("reseed")
                 worlds[world]["reseeds"] += int(np.sum(reseed_events))
                 worlds[world]["reseed_ticks"].extend(columns["tick"][reseed_events].tolist())
@@ -1032,6 +1040,9 @@ def summarize(cfg, result, seeds, cohort_len: int, chunk: int = CHUNK) -> dict:
                 "world": world,
                 "seed": int(seeds[world]),
                 "post_ramp_rescues": int(post_rescues),
+                "rescue_start_tick": (
+                    int(min(data["reseed_ticks"])) if data["reseed_ticks"] else None
+                ),
                 "final_population": int(pop[-1, world]),
             }
         )
@@ -1042,7 +1053,57 @@ def summarize(cfg, result, seeds, cohort_len: int, chunk: int = CHUNK) -> dict:
             entry = generation_bites.setdefault(key, {"bites_living": 0, "meat_animal": 0.0})
             entry["bites_living"] += int(data["bites_living"].get(int(uid), 0))
             entry["meat_animal"] += float(data["meat_animal"].get(int(uid), 0.0))
+        snapshots_data = None
+    if SNAPSHOTS and result.get("tracker"):
+        snapshots_data = []
+        for world, samples in enumerate(result["tracker"]):
+            for sample in samples:
+                alive = np.asarray(sample["alive"])
+                if not np.any(alive):
+                    continue
+                positions = np.asarray(sample["pos"])[alive]
+                snapshots_data.append(
+                    {
+                        "world": world,
+                        "tick": int(sample["tick"]),
+                        "uid": np.asarray(sample["uid"])[alive].tolist(),
+                        "x": positions[:, 0].tolist(),
+                        "y": positions[:, 1].tolist(),
+                    }
+                )
+    generation_behavior = {}
+    for data in result["worlds"]:
+        death_tick = {int(row[1]): int(row[0]) for row in data["deaths"]}
+        generation = data["generation"]
+        for uid, died in death_tick.items():
+            born = int(data["births"][uid][0]) if uid in data["births"] else 0
+            lifetime = max(died - born, 1)
+            key = str(int(generation.get(uid, 0)))
+            entry = generation_behavior.setdefault(
+                key,
+                {
+                    "individuals": 0,
+                    "lifetime_ticks": 0,
+                    "bush_bites": 0,
+                    "bites_living": 0,
+                    "meat_animal": 0.0,
+                },
+            )
+            entry["individuals"] += 1
+            entry["lifetime_ticks"] += lifetime
+            entry["bush_bites"] += int(data["bites"].get(uid, 0))
+            entry["bites_living"] += int(data["bites_living"].get(uid, 0))
+            entry["meat_animal"] += float(data["meat_animal"].get(uid, 0.0))
+    for entry in generation_behavior.values():
+        ticks = entry["lifetime_ticks"]
+        bites = entry["bush_bites"] + entry["bites_living"]
+        entry["bush_bites_per_lifetime_tick"] = entry["bush_bites"] / ticks if ticks else None
+        entry["bite_living_ratio"] = (
+            entry["bites_living"] / bites if bites else None
+        )
     return {
+        "snapshots": snapshots_data,
+        "generation_behavior": generation_behavior,
         "per_1000": per_1000,
         "post_ramp": post_ramp,
         "generation_bites": generation_bites,
@@ -1219,13 +1280,16 @@ def main() -> None:
     parser.add_argument("--founder-logit-std", type=float, default=None)
     parser.add_argument("--reseed-until-tick", type=int, default=-1)
     parser.add_argument("--chunk", type=int, default=128)
+    parser.add_argument("--snapshots", action="store_true")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
     global KNOB, KNOB_MODE, AVOID_TOXIN, MIN_STOCK, AVOID_HOT
     global STATIONARY, PIN_BUSH_STOCK, SKIP_BITE_RATE, HUNGER_THRESHOLD, STOCK_MIN
+    global SNAPSHOTS
     HUNGER_THRESHOLD = float(args.hunger_threshold)
     STOCK_MIN = float(args.stock_min)
+    SNAPSHOTS = bool(args.snapshots)
     KNOB = float(args.knob)
     KNOB_MODE = args.knob_mode
     AVOID_TOXIN = bool(args.avoid_toxin)

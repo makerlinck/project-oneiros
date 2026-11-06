@@ -682,3 +682,13 @@ def test_bites_by_species_maps_target_uid_per_world():
     assert out["cold"] == 1 + 4
     assert out["unknown"] == 0
 
+
+
+def test_meat_intake_uses_dn_and_ignores_absorbed():
+    events = [
+        {"uid": 3, "target_kind": C.CARCASS, "dn": [0.0, 0.3, 0.0]},
+        {"uid": 4, "target_kind": C.BUSH, "dn": [1.0, 0.0, 0.0]},
+    ]
+    out = summary.meat_intake_by_actor(events)
+    assert out == {3: 0.3}
+

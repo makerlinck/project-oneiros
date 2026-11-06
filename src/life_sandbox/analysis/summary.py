@@ -939,3 +939,20 @@ def bites_by_species(
             counts[mapping.get(int(target), "unknown")] += int(count)
     return counts
 
+
+
+def meat_intake_by_actor(events: Sequence[Mapping[str, Any]]) -> dict[int, float]:
+    """Animal mass taken per actor from living/carcass bites (dn, not absorbed).
+
+    bite events carry the mass actually taken into the stomach in dn; absorbed
+    is zero in this engine (absorption happens later in metabolism), so the meat
+    metric must read dn.
+    """
+    result: dict[int, float] = {}
+    for event in events:
+        if int(event["target_kind"]) not in (C.CREATURE, C.CARCASS):
+            continue
+        uid = int(event["uid"])
+        result[uid] = result.get(uid, 0.0) + float(np.asarray(event["dn"])[C.ANIMAL])
+    return result
+
