@@ -606,3 +606,79 @@ def test_summarize_matches_diagnostics_json_keys():
     assert result["individuals_export"] is None
     assert result["track"] is None
     assert result["intake_by_maturity"]["juvenile"]["individual_ticks"] == 0.0
+
+
+def test_generation_summary_tracks_multi_world_uid_collisions():
+    generations = [
+        {1: 0, 2: 0, 10: 1},
+        {1: 0, 2: 0, 10: 2},
+    ]
+    births_by_parent = {(0, 1): 3, (0, 2): 0, (1, 1): 1, (1, 10): 2}
+    out = summary.generation_summary(generations, births_by_parent)
+    assert out["individuals_by_generation"] == {"0": 4, "1": 1, "2": 1}
+    assert out["births_by_generation"] == {"0": 4, "1": 0, "2": 2}
+    assert out["r0_by_generation"]["0"] == pytest.approx(1.0)
+    assert out["r0_by_generation"]["1"] == pytest.approx(0.0)
+    assert out["r0_by_generation"]["2"] == pytest.approx(2.0)
+
+
+def test_generation_summary_handles_missing_parent_as_founder():
+    out = summary.generation_summary([{7: 0}], {(0, 99): 2})
+    assert out["individuals_by_generation"] == {"0": 1}
+    assert out["r0_by_generation"]["0"] == pytest.approx(2.0)
+
+
+def test_stock_by_species_splits_kinds_and_low_stock_fraction():
+    samples = [
+        [
+            {
+                "bush_alive": np.asarray([True, True, False]),
+                "bush_kind": np.asarray([0, 2, 0]),
+                "stock": np.asarray([0.2, 0.4, 0.0]),
+            }
+        ],
+        [
+            {
+                "bush_alive": np.asarray([True]),
+                "bush_kind": np.asarray([2]),
+                "stock": np.asarray([0.05]),
+            }
+        ],
+    ]
+    out = summary.stock_by_species(samples, {0: "cold", 2: "nut"})
+    assert out["cold"]["mean"] == pytest.approx(0.2)
+    assert out["cold"]["below_0_1_fraction"] == pytest.approx(0.0)
+    assert out["nut"]["mean"] == pytest.approx((0.4 + 0.05) / 2)
+    assert out["nut"]["below_0_1_fraction"] == pytest.approx(0.5)
+
+
+def test_end_population_rho_uses_last_sample_alive_only():
+    samples = [
+        [
+            {
+                "alive": np.asarray([True, True]),
+                "rho_animal": np.asarray([0.1, 0.3]),
+            }
+        ],
+        [
+            {
+                "alive": np.asarray([True, False]),
+                "rho_animal": np.asarray([0.2, 0.9]),
+            }
+        ],
+    ]
+    out = summary.end_population_rho(samples)
+    assert out["individuals"] == 3
+    assert out["mean"] == pytest.approx((0.1 + 0.3 + 0.2) / 3)
+    assert out["fraction_below_0_2"] == pytest.approx(1 / 3)
+
+
+def test_bites_by_species_maps_target_uid_per_world():
+    targets = [{10: 3, 20: 1}, {10: 4}]
+    bush_uids = [[10, 20], [10]]
+    bush_kinds = [[2, 0], [0]]
+    out = summary.bites_by_species(targets, bush_uids, bush_kinds, {0: "cold", 2: "nut"})
+    assert out["nut"] == 3
+    assert out["cold"] == 1 + 4
+    assert out["unknown"] == 0
+

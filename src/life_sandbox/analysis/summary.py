@@ -833,3 +833,109 @@ def summarize(
         "lifespan_reseed": lifespans["reseed"],
         "cohorts_reproduction": cohort_summary(worlds, params.cohort_len),
     }
+
+
+# --- generation / species-level summaries (M1 K calibration) ----------------
+
+
+def generation_summary(
+    generations: Sequence[Mapping[int, int]],
+    births_by_parent: Mapping[tuple[int, int], int],
+) -> dict:
+    """R0 per generation from a per-world uid -> generation map.
+
+    generations[world] maps uid -> generation (founders 0, child = parent + 1,
+    reseeded individuals generation 0).  births_by_parent keys are (world, uid).
+    """
+    gen_individuals: Counter = Counter()
+    gen_births: Counter = Counter()
+    for mapping in generations:
+        for generation in mapping.values():
+            gen_individuals[int(generation)] += 1
+    for (world, parent), count in births_by_parent.items():
+        mapping = generations[int(world)]
+        generation = int(mapping.get(int(parent), 0))
+        gen_births[generation] += int(count)
+    summary = {
+        "individuals_by_generation": {},
+        "births_by_generation": {},
+        "r0_by_generation": {},
+    }
+    for generation in sorted(set(gen_individuals) | set(gen_births)):
+        individuals = gen_individuals.get(generation, 0)
+        births = gen_births.get(generation, 0)
+        summary["individuals_by_generation"][str(generation)] = individuals
+        summary["births_by_generation"][str(generation)] = births
+        summary["r0_by_generation"][str(generation)] = (
+            births / individuals if individuals else None
+        )
+    return summary
+
+
+def stock_by_species(
+    samples_by_world: Sequence[Sequence[Mapping[str, Any]]],
+    labels: Mapping[int, str],
+) -> dict:
+    """Mean stock and fraction below 0.1 per bush species across tracker samples."""
+    result: dict = {}
+    for kind_id, label in labels.items():
+        means, lows = [], []
+        for samples in samples_by_world:
+            for sample in samples:
+                mask = np.asarray(sample["bush_alive"]) & (
+                    np.asarray(sample["bush_kind"]) == kind_id
+                )
+                if np.any(mask):
+                    values = np.asarray(sample["stock"])[mask]
+                    means.append(float(np.mean(values)))
+                    lows.append(float(np.mean(values < 0.1)))
+        result[label] = {
+            "mean": float(np.mean(means)) if means else None,
+            "below_0_1_fraction": float(np.mean(lows)) if lows else None,
+        }
+    return result
+
+
+def end_population_rho(
+    samples_by_world: Sequence[Sequence[Mapping[str, Any]]],
+) -> dict:
+    """Diet rho_A distribution over individuals alive in the last sample."""
+    values = []
+    for samples in samples_by_world:
+        if not samples:
+            continue
+        last = samples[-1]
+        alive = np.asarray(last["alive"])
+        values.extend(float(v) for v in np.asarray(last["rho_animal"])[alive])
+    if not values:
+        return {}
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "individuals": int(array.size),
+        "mean": float(np.mean(array)),
+        "median": float(np.median(array)),
+        "p10": float(np.percentile(array, 10)),
+        "p90": float(np.percentile(array, 90)),
+        "fraction_below_0_2": float(np.mean(array < 0.2)),
+        "fraction_below_0_34": float(np.mean(array < 0.34)),
+    }
+
+
+def bites_by_species(
+    bite_targets: Sequence[Mapping[int, int]],
+    bush_uids: Sequence[Sequence[int]],
+    bush_kinds: Sequence[Sequence[int]],
+    labels: Mapping[int, str],
+) -> dict:
+    """Bush-bite counts split by bush species (target uid -> species)."""
+    counts = {label: 0 for label in labels.values()}
+    counts["unknown"] = 0
+    for world, targets in enumerate(bite_targets):
+        mapping = {
+            int(uid): labels.get(int(kind), "unknown")
+            for uid, kind in zip(bush_uids[world], bush_kinds[world])
+        }
+        for target, count in targets.items():
+            counts[mapping.get(int(target), "unknown")] += int(count)
+    return counts
+
