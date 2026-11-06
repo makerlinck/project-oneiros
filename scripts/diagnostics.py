@@ -52,9 +52,11 @@ AVOID_HOT = 0.0
 STATIONARY = False
 PIN_BUSH_STOCK = False
 SKIP_BITE_RATE = 0.0
+HUNGER_THRESHOLD = 0.8
 PINNED_BUSH_SLOTS = jnp.zeros((0,), dtype=jnp.int32)
 PINNED_POS = None
 PINNED_THETA = None
+STATIONARY_META = None
 
 
 def _wrap(angle):
@@ -170,7 +172,7 @@ def forager_think(state, cfg):
     if STATIONARY:
         facing = jnp.ones_like(facing)
     stomach = jnp.sum(creature.body.G, axis=1)
-    hungry = stomach < 0.8 * 0.3
+    hungry = stomach < HUNGER_THRESHOLD * 0.3
 
     # Bite only if the engine's nearest bite target is the chosen bush: the
     # engine picks the nearest entity within +-30 degrees and reach, so the
@@ -270,10 +272,11 @@ def _world(states, index):
 
 def stationary_setup(states, cfg):
     """Place each founder at the centre of its own bush (diagnostic only)."""
-    global PINNED_BUSH_SLOTS, PINNED_POS, PINNED_THETA
+    global PINNED_BUSH_SLOTS, PINNED_POS, PINNED_THETA, STATIONARY_META
     slots = jnp.arange(int(cfg.world.founders), dtype=jnp.int32)
     PINNED_BUSH_SLOTS = slots
     creature = states.entities.creature
+    meta_all = []
     for world in range(int(states.tick.shape[0])):
         wstate = _world(states, world)
         w_creature = wstate.entities.creature
@@ -288,7 +291,20 @@ def stationary_setup(states, cfg):
         for i, species in enumerate(best_species):
             candidates = np.nonzero(alive & (kinds == species))[0]
             chosen[i] = int(candidates[0]) if candidates.size else int(np.nonzero(alive)[0][0])
-        bush_pos = jnp.asarray(np.asarray(bush.transform.pos)[chosen])
+        bush_pos_arr = np.asarray(bush.transform.pos)[chosen]
+        bush_pos = jnp.asarray(bush_pos_arr)
+        theta = np.asarray(reproduction_system.theta_repro(w_creature, cfg))[: int(cfg.world.founders)]
+        scaled_t = cfg.world.temperature_scale * (
+            -2.0 + 4.0 * bush_pos_arr[:, 1] / cfg.world.height
+        ) - 0.5
+        meta_all.append(
+            {
+                "rho": rho,
+                "theta": theta,
+                "species": np.asarray(kinds)[chosen],
+                "temperature_geo_shade": scaled_t,
+            }
+        )
         transform = w_creature.transform
         transform = update(
             transform,
@@ -302,6 +318,7 @@ def stationary_setup(states, cfg):
         )
     PINNED_POS = creature.transform.pos
     PINNED_THETA = creature.transform.theta
+    STATIONARY_META = meta_all
     return update(states, entities=update(states.entities, creature=creature))
 
 
@@ -386,6 +403,9 @@ def run_worlds(
     states = _stack([initial_state(cfg, seed=seed) for seed in seeds])
     if initial_hook is not None:
         states = initial_hook(states, cfg)
+    founder_uids = np.asarray(
+        states.entities.creature.identity.uid[:, : int(cfg.world.founders)]
+    ).tolist()
     worlds = [
         {
             "births": {},        # uid -> (tick, reseed: bool, parent_uid)
@@ -394,6 +414,7 @@ def run_worlds(
             "reseeds": 0,
             "birth_fail": Counter(),
             "birth_fail_parents": {},
+            "birth_fail_nutrients": Counter(),
             "births_by_parent": Counter(),
         }
         for _ in seeds
@@ -432,12 +453,16 @@ def run_worlds(
                     if int(parent) >= 0:
                         worlds[world]["births_by_parent"][int(parent)] += 1
                 fails = columns["kind"] == events_mod.kind_code("birth_fail")
-                for uid, reason in zip(
-                    columns["uid"][fails].tolist(), columns["reason"][fails].tolist()
+                for uid, reason, nutrient in zip(
+                    columns["uid"][fails].tolist(),
+                    columns["reason"][fails].tolist(),
+                    columns["nutrient"][fails].tolist(),
                 ):
                     name = events_mod.REASONS[int(reason)]
                     worlds[world]["birth_fail"][name] += 1
                     worlds[world]["birth_fail_parents"].setdefault(name, set()).add(int(uid))
+                    if name == "no_reserve" and 0 <= int(nutrient) < 3:
+                        worlds[world]["birth_fail_nutrients"][NUTRIENT_LABELS[int(nutrient)]] += 1
                 deaths = columns["kind"] == events_mod.kind_code("death")
                 for tick, uid, cause, nutrient, same, loss in zip(
                     columns["tick"][deaths].tolist(),
@@ -470,10 +495,7 @@ def run_worlds(
                 sum_n = np.asarray(jnp.sum(creat.body.N, axis=1))
                 theta = np.asarray(reproduction_system.theta_repro(creat, cfg))
                 mass = 0.3 + 0.7 * np.asarray(creat.body.mu)
-                tissue_need = np.asarray([0.0, 0.009, 0.021])  # c_flesh * 0.03
-                tissue_short = tissue_need[None, :] - nutrients
-                blocked = (sum_n >= theta) & (mass >= 1.0) & np.any(tissue_short > 0, axis=1)
-                blocked_nutrient = np.argmin(np.where(tissue_need > 0, nutrients / tissue_need, np.inf), axis=1)
+
                 tracker[world].append(
                     {
                         "tick": int(states.tick[world]),
@@ -484,8 +506,6 @@ def run_worlds(
                         "mass": mass,
                         "limiting": np.argmin(ratio, axis=1),
                         "limiting_absolute": np.argmax(deficit, axis=1),
-                        "blocked": blocked,
-                        "blocked_nutrient": blocked_nutrient,
                         "stock": np.asarray(bush.edible.stock),
                         "bush_alive": np.asarray(bush.alive),
                     }
@@ -501,6 +521,7 @@ def run_worlds(
         "states": states,
         "tracker": tracker,
         "dropped_events": dropped_events,
+        "founder_uids": founder_uids,
     }
 
 
@@ -625,46 +646,82 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
     }
     birth_fail_counts: Counter = Counter()
     birth_fail_parents: dict = {}
-    births_by_parent: Counter = Counter()
-    for data in result["worlds"]:
+    birth_fail_nutrients: Counter = Counter()
+    births_by_parent: dict = {}
+    births_total = 0
+    for world, data in enumerate(result["worlds"]):
         birth_fail_counts.update(data["birth_fail"])
+        birth_fail_nutrients.update(data["birth_fail_nutrients"])
         for reason, parents in data["birth_fail_parents"].items():
-            birth_fail_parents.setdefault(reason, set()).update(parents)
-        births_by_parent.update(data["births_by_parent"])
-    births_total = int(sum(births_by_parent.values()))
-    individuals = int(cfg.world.founders) + int(
-        sum(len(data["births"]) for data in result["worlds"])
-    )
-    r0_values = [int(value) for value in births_by_parent.values()]
-    first_birth_ages = []
-    for data in result["worlds"]:
-        first = {}
-        for uid, (tick, _reseed, parent) in data["births"].items():
-            if parent >= 0:
-                first[parent] = min(first.get(parent, tick), tick)
-        for parent, first_tick in first.items():
-            born = data["births"].get(parent)
-            if born is not None:
-                first_birth_ages.append(int(first_tick) - int(born[0]))
+            birth_fail_parents.setdefault(reason, set()).update(
+                (world, int(parent)) for parent in parents
+            )
+        for parent, count in data["births_by_parent"].items():
+            births_by_parent[(world, int(parent))] = int(count)
+            births_total += int(count)
+    n_worlds = len(result["worlds"])
+    founders_total = int(cfg.world.founders) * n_worlds
+    individuals = founders_total + births_total
+    founder_counts, repro_counts = [], []
+    first_birth_ages, founder_first, repro_first = [], [], []
+    for (world, parent), count in births_by_parent.items():
+        data = result["worlds"][world]
+        first_tick = min(
+            tick for uid, (tick, _reseed, pid) in data["births"].items() if pid == parent
+        )
+        born = data["births"].get(parent)
+        if born is None:
+            founder_counts.append(count)
+            founder_first.append(first_tick)
+        else:
+            repro_counts.append(count)
+            repro_first.append(first_tick - born[0])
+    first_birth_ages = founder_first + repro_first
+
+    def _group_stats(counts, individuals_in_group):
+        return {
+            "individuals": int(individuals_in_group),
+            "births": int(sum(counts)),
+            "mean_r0": (sum(counts) / individuals_in_group) if individuals_in_group else None,
+            "reproducing_parents": len(counts),
+            "mean_r0_reproducing": float(np.mean(counts)) if counts else None,
+            "max_r0": int(max(counts)) if counts else 0,
+            "fraction_reproducing_with_2plus": (
+                float(np.mean([value >= 2 for value in counts])) if counts else None
+            ),
+            "fraction_reproducing_with_3plus": (
+                float(np.mean([value >= 3 for value in counts])) if counts else None
+            ),
+        }
+
     r0 = {
         "births_total": births_total,
         "individuals_ever": individuals,
+        "founders": _group_stats(founder_counts, founders_total),
+        "reproduction_born": _group_stats(repro_counts, births_total),
         "mean_r0_all_individuals": births_total / max(individuals, 1),
-        "reproducing_parents": len(r0_values),
-        "mean_r0_reproducing": float(np.mean(r0_values)) if r0_values else None,
-        "max_r0": max(r0_values) if r0_values else 0,
+        "reproducing_parents": len(founder_counts) + len(repro_counts),
+        "mean_r0_reproducing": (
+            float(np.mean(founder_counts + repro_counts))
+            if founder_counts or repro_counts
+            else None
+        ),
+        "max_r0": int(max(founder_counts + repro_counts)) if founder_counts or repro_counts else 0,
         "fraction_reproducing_with_2plus": (
-            float(np.mean([value >= 2 for value in r0_values])) if r0_values else None
+            float(np.mean([value >= 2 for value in founder_counts + repro_counts]))
+            if founder_counts or repro_counts
+            else None
         ),
         "fraction_reproducing_with_3plus": (
-            float(np.mean([value >= 3 for value in r0_values])) if r0_values else None
+            float(np.mean([value >= 3 for value in founder_counts + repro_counts]))
+            if founder_counts or repro_counts
+            else None
         ),
     }
     track_summary = None
     if result.get("tracker"):
         max_ratio, ever_above, above_fractions, limiting_counts = [], 0, [], Counter()
         absolute_limiting = Counter()
-        blocked_individuals, blocked_fractions, blocked_nutrients = 0, [], Counter()
         stock_means, low_stock = [], []
         for samples in result["tracker"]:
             stats = {}
@@ -685,9 +742,6 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
                             "n": 0,
                             "lim": Counter(),
                             "abs_lim": Counter(),
-                            "eligible": 0,
-                            "blocked": 0,
-                            "blocked_lim": Counter(),
                         },
                     )
                     entry["max"] = max(entry["max"], ratio)
@@ -695,25 +749,12 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
                     entry["n"] += 1
                     entry["lim"][int(sample["limiting"][index])] += 1
                     entry["abs_lim"][int(sample["limiting_absolute"][index])] += 1
-                    if (
-                        sample["mass"][index] >= 1.0
-                        and sample["sum_n"][index] >= sample["theta"][index]
-                    ):
-                        entry["eligible"] += 1
-                        if bool(sample["blocked"][index]):
-                            entry["blocked"] += 1
-                            entry["blocked_lim"][int(sample["blocked_nutrient"][index])] += 1
             for entry in stats.values():
                 max_ratio.append(entry["max"])
                 ever_above += int(entry["above"] > 0)
                 above_fractions.append(entry["above"] / max(entry["n"], 1))
                 limiting_counts[entry["lim"].most_common(1)[0][0]] += 1
                 absolute_limiting[entry["abs_lim"].most_common(1)[0][0]] += 1
-                if entry["eligible"]:
-                    blocked_individuals += int(entry["blocked"] > 0)
-                    blocked_fractions.append(entry["blocked"] / entry["eligible"])
-                    for key, value in entry["blocked_lim"].items():
-                        blocked_nutrients[key] += value
         track_summary = {
             "individuals_tracked": len(max_ratio),
             "median_max_sumN_over_theta": float(np.median(max_ratio)) if max_ratio else None,
@@ -727,19 +768,42 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
             "limiting_nutrient_absolute": {
                 NUTRIENT_LABELS[key]: value for key, value in absolute_limiting.items()
             },
-            "blocked_reproduction": {
-                "individuals_with_eligible_time": len(blocked_fractions),
-                "individuals_ever_blocked": blocked_individuals,
-                "mean_blocked_fraction_of_eligible_time": (
-                    float(np.mean(blocked_fractions)) if blocked_fractions else None
-                ),
-                "blocking_nutrient_counts": {
-                    NUTRIENT_LABELS[key]: value for key, value in blocked_nutrients.items()
-                },
-            },
             "bush_stock_mean": float(np.mean(stock_means)) if stock_means else None,
             "bush_stock_below_0_1_fraction": float(np.mean(low_stock)) if low_stock else None,
         }
+    individuals_export = None
+    if STATIONARY and STATIONARY_META is not None:
+        individuals_export = []
+        for world, meta in enumerate(STATIONARY_META):
+            data = result["worlds"][world]
+            uids = result["founder_uids"][world]
+            for index in range(len(meta["rho"])):
+                uid = int(uids[index])
+                birth_ticks = sorted(
+                    tick for _uid, (tick, _reseed, parent) in data["births"].items() if parent == uid
+                )
+                death = next((row for row in data["deaths"] if row[1] == uid), None)
+                individuals_export.append(
+                    {
+                        "world": world,
+                        "uid": uid,
+                        "rho": [float(value) for value in meta["rho"][index]],
+                        "theta": float(meta["theta"][index]),
+                        "species": int(meta["species"][index]),
+                        "temperature_geo_shade": float(meta["temperature_geo_shade"][index]),
+                        "births": len(birth_ticks),
+                        "birth_ages": [int(tick) for tick in birth_ticks],
+                        "death_age": int(death[0]) if death is not None else None,
+                        "death_cause": (
+                            events_mod.DEATH_CAUSES[death[2]] if death is not None else None
+                        ),
+                        "death_nutrient": (
+                            NUTRIENT_LABELS[int(death[3])]
+                            if death is not None and 0 <= int(death[3]) < 3
+                            else None
+                        ),
+                    }
+                )
     individual_ticks = float(np.sum(pop)) * CHUNK
     harvest = float(np.asarray(result["ledger"]["inflow"])[:, C.INFLOW_BITES, :].sum())
     demand = float(np.asarray(result["ledger"]["outflow"])[:, C.OUTFLOW_METABOLISM, :].sum())
@@ -747,14 +811,18 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
         "intake_per_individual_tick": harvest / max(individual_ticks, 1.0),
         "demand_per_individual_tick": demand / max(individual_ticks, 1.0),
         "individual_ticks": individual_ticks,
+        "individuals_export": individuals_export,
         "r0": r0,
         "first_birth_age": {
             "count": len(first_birth_ages),
             "median": float(np.median(first_birth_ages)) if first_birth_ages else None,
+            "founders_median": float(np.median(founder_first)) if founder_first else None,
+            "reproduction_median": float(np.median(repro_first)) if repro_first else None,
         },
         "birth_fail": {
             "counts": dict(birth_fail_counts),
             "unique_parents": {key: len(value) for key, value in birth_fail_parents.items()},
+            "no_reserve_nutrients": dict(birth_fail_nutrients),
         },
         "track": track_summary,
         "dropped_events": int(result.get("dropped_events", 0)),
@@ -851,11 +919,13 @@ def main() -> None:
     parser.add_argument("--stationary", action="store_true")
     parser.add_argument("--pin-bush-stock", action="store_true")
     parser.add_argument("--skip-bite-rate", type=float, default=0.0)
+    parser.add_argument("--hunger-threshold", type=float, default=0.8)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
     global KNOB, KNOB_MODE, AVOID_TOXIN, MIN_STOCK, AVOID_HOT
-    global STATIONARY, PIN_BUSH_STOCK, SKIP_BITE_RATE
+    global STATIONARY, PIN_BUSH_STOCK, SKIP_BITE_RATE, HUNGER_THRESHOLD
+    HUNGER_THRESHOLD = float(args.hunger_threshold)
     KNOB = float(args.knob)
     KNOB_MODE = args.knob_mode
     AVOID_TOXIN = bool(args.avoid_toxin)
@@ -882,6 +952,7 @@ def main() -> None:
         "stationary": STATIONARY,
         "pin_bush_stock": PIN_BUSH_STOCK,
         "skip_bite_rate": SKIP_BITE_RATE,
+        "hunger_threshold": HUNGER_THRESHOLD,
     }
     summary["founder_animal_logit_mean"] = cfg.body.founder_animal_logit_mean
     summary["design"] = {

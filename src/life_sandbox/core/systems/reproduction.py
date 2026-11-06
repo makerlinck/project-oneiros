@@ -34,7 +34,9 @@ Documented decisions (SANDBOX.md is silent):
 - A parent that cannot pay B_child fails with `no_reserve` (default arm) or
   `no_tissue` (control arm); a parent with no free candidate position, or with
   no free creature slot left in slot order, fails with `no_room`.  Failed
-  births consume no slot, uid or payment.
+  births consume no slot, uid or payment.  A `no_reserve` event also carries
+  the blocked nutrient in the existing `nutrient` field (P/A with the smallest
+  N_j / B_child_j; T never participates); successful births keep -1.
 - Mutation scales come from brain/genome.mutation_sigmas (§6.3), and genome /
   fast-weight widths come from brain/genome.layout(cfg): they are derived from
   H, D, M and N_OUT, never configured by hand.
@@ -196,9 +198,18 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     if cfg.reproduction.tissue_from_reserves:
         payment_ok = jnp.all(parent_body.N >= tissue_cost[None, :], axis=1)
         payment_reason = events.reason_code("no_reserve")
+        # Diagnostic for birth_fail(no_reserve): which reserve blocks the birth?
+        # Compare the P/A components by N_j / B_child_j; T does not participate
+        # because B_child_T = 0.  Ties keep the earliest index (P before A).
+        pa_cost = tissue_cost[: C.ANIMAL + 1]
+        ratio = parent_body.N[:, : C.ANIMAL + 1] / jnp.maximum(
+            pa_cost[None, :], jnp.asarray(1e-9, jnp.float32)
+        )
+        stuck_nutrient = jnp.argmin(ratio, axis=1).astype(jnp.int8)
     else:
         payment_ok = jnp.all(parent_body.B >= tissue_cost[None, :], axis=1)
         payment_reason = events.reason_code("no_tissue")
+        stuck_nutrient = jnp.full((capacity,), C.NO_REF, dtype=jnp.int8)
 
     # Child position: first free candidate in the documented order.
     positions, free_position = _candidate_positions(state, cfg, slots)
@@ -530,6 +541,16 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     )
     event_x = jnp.where(success, child_position[:, 0], creature.transform.pos[:, 0])
     event_y = jnp.where(success, child_position[:, 1], creature.transform.pos[:, 1])
+    # A no_reserve failure reports the blocked nutrient in the existing nutrient
+    # field; successful births and all other events keep -1.
+    if cfg.reproduction.tissue_from_reserves:
+        event_nutrient = jnp.where(
+            eligible_mask & (~success) & (~deferred) & (~payment_ok),
+            stuck_nutrient,
+            jnp.asarray(C.NO_REF, jnp.int8),
+        ).astype(jnp.int8)
+    else:
+        event_nutrient = jnp.full((capacity,), C.NO_REF, dtype=jnp.int8)
     buffer = append_events_batch(
         buffer,
         eligible_mask,
@@ -541,6 +562,7 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
         target_uid=creature.identity.uid,
         x=event_x,
         y=event_y,
+        nutrient=event_nutrient,
         success=success | deferred,
         reason=jnp.where(success | deferred, jnp.asarray(0, jnp.int8), reason),
     )

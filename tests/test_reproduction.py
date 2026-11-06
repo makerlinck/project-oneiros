@@ -123,6 +123,7 @@ def records(buffer) -> list[dict]:
                 "target_uid": int(buffer.target_uid[i]),
                 "success": bool(buffer.success[i]),
                 "reason": int(buffer.reason[i]),
+                "nutrient": int(buffer.nutrient[i]),
             }
         )
     return result
@@ -368,6 +369,7 @@ def test_reserve_payment_keeps_adult_tissue():
     assert len(births) == 1
     assert births[0]["uid"] == START_UID
     assert births[0]["parent_uid"] == 1
+    assert births[0]["nutrient"] == -1  # success keeps the neutral value
     cre = out.entities.creature
     tissue = reproduction.CHILD_TISSUE * FLESH
     child_rho = world_init.diet_from_genome(cre.genome.g[1:2], cfg)[0]
@@ -400,6 +402,7 @@ def test_reserve_payment_fails_without_reserve():
     assert fails[0]["reason"] == events.reason_code("no_reserve")
     assert fails[0]["uid"] == 9
     assert fails[0]["parent_uid"] == C.NO_REF
+    assert fails[0]["nutrient"] == C.PLANT  # P is the blocked reserve
     cre = out.entities.creature
     assert not bool(cre.alive[1])
     assert jnp.allclose(cre.body.N[0], reserves, atol=1e-7)
@@ -478,3 +481,39 @@ def test_control_arm_keeps_old_tissue_payment():
     fails = of_kind(fail_buffer, "birth_fail")
     assert len(fails) == 1
     assert fails[0]["reason"] == events.reason_code("no_tissue")
+    assert fails[0]["nutrient"] == C.NO_REF  # control arm has no reserve diagnostic
+
+
+def _no_reserve_case(state, cfg, reserves, tissue=(0.15, 0.35, 0.0), uid=31):
+    state = add_parent(
+        state, cfg, 0, pos=(10.0, 10.0), uid=uid,
+        reserves=reserves, tissue=tissue,
+    )
+    out, buffer = reproduction.apply(state, cfg)
+    fails = of_kind(buffer, "birth_fail")
+    assert len(fails) == 1
+    assert fails[0]["reason"] == events.reason_code("no_reserve")
+    return fails[0]
+
+
+def test_no_reserve_reports_the_blocked_nutrient():
+    """birth_fail(no_reserve).nutrient names P/A with the smallest N_j/B_child_j."""
+    cfg = make_cfg(8)
+    # Only plant reserves are below B_child_P = 0.009.
+    only_plant = _no_reserve_case(base_state(cfg), cfg, (0.001, 0.5, 0.5))
+    assert only_plant["nutrient"] == C.PLANT
+    # Only animal reserves are below B_child_A = 0.021.
+    only_animal = _no_reserve_case(base_state(cfg), cfg, (0.5, 0.001, 0.5), uid=32)
+    assert only_animal["nutrient"] == C.ANIMAL
+
+    # Toxin never participates in B_child: N_T = 0 does not block the birth.
+    state = base_state(cfg)
+    state = add_parent(
+        state, cfg, 0, pos=(10.0, 10.0), uid=33,
+        reserves=(0.5, 0.5, 0.0), tissue=(0.15, 0.35, 0.0),
+    )
+    out, buffer = reproduction.apply(state, cfg)
+    births = of_kind(buffer, "birth")
+    assert len(births) == 1
+    assert births[0]["nutrient"] == -1
+    assert bool(out.entities.creature.alive[1])

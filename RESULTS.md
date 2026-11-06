@@ -11,3 +11,4 @@ prereg_id 指向 prereg/ 下的预注册文档。探索性结果不能作为确�
 | 2026-11-06 | M1 决定性可行性：库存感知探针+关闭救援，设计代谢 0.002 灭绝；0.5× 仍灭绝；0.25× 32k tick 内 2/4 世界灭绝、2 个低种群振荡；harvest/cost 1.03–1.09、排泄占吸收 30–31%、动物营养主限制；fixed 臂在 0.25× 仍灭绝 | 探索 | diagnostics7/8/9/10（远端 runs/） | — | results/004-m1-decisive.md |
 | 2026-11-06 | M1 探针 v2 矩阵：frozenstart 世界 6 组均 R0≈1.0（种群 26–101），target 世界 6 组全部灭绝（R0all 0.06–0.56，远低于模型预测 4–6）→ 按复核判读进入“对账”，暂不改规格常量；N 支付已生效，B 支付对照可用 | 探索 | matrix2（远端 runs/） | — | results/005-m1-probe-v2-matrix.md |
 | 2026-11-06 | M1 静止食物对账：钉库存 + 匹配食性时父代 R0=5（模型预测 4–6），正常再生单丛 R0=2、摄入 0.006<需求 0.007 → 引擎预算对账通过，matrix2 差距归因于觅食效率；下一步扫描 base_metabolism | 探索 | stationary（远端 runs/） | — | results/006-m1-stationary-reconciliation.md |
+| 2026-11-06 | M1 R0 修正：按（世界,uid）分组、分母含创始×世界；target 修正 R0 0.02–0.24；32 个体静止对账创始平均 R0=2.16（12/32 零胎）、no_reserve 卡住营养全为 animal；降级探针校准为饥饿阈值 h=0.2（摄入 56.7%）；修正后 base 扫描重跑中 | 探索 | stationary32 / degraded / basescan2（远端 runs/） | — | results/007-m1-r0-fix.md |
