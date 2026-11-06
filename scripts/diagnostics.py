@@ -377,6 +377,7 @@ def _flatten(buffers, world: int) -> dict:
         "reason",
         "loss",
         "parent_uid",
+        "absorbed",
     ):
         columns[name] = np.asarray(getattr(buffers, name))[:, world][mask]
     return columns
@@ -410,6 +411,8 @@ def run_worlds(
             "birth_fail_nutrients": Counter(),
             "births_by_parent": Counter(),
             "bite_targets": Counter(),
+            "bites_living": Counter(),
+            "meat_animal": Counter(),
             "generation": {},
         }
         for _ in seeds
@@ -488,6 +491,20 @@ def run_worlds(
                 ):
                     worlds[world]["bites"][int(uid)] += 1
                     worlds[world]["bite_targets"][int(target)] += 1
+                living = (columns["kind"] == events_mod.kind_code("bite")) & (
+                    (columns["target_kind"] == C.CREATURE)
+                    | (columns["target_kind"] == C.CARCASS)
+                )
+                for uid, target_kind, absorbed in zip(
+                    columns["uid"][living].tolist(),
+                    columns["target_kind"][living].tolist(),
+                    columns["absorbed"][living].tolist(),
+                ):
+                    if int(target_kind) == C.CREATURE:
+                        worlds[world]["bites_living"][int(uid)] += 1
+                    worlds[world]["meat_animal"][int(uid)] += float(
+                        np.asarray(absorbed)[C.ANIMAL]
+                    )
                 reseed_events = columns["kind"] == events_mod.kind_code("reseed")
                 worlds[world]["reseeds"] += int(np.sum(reseed_events))
                 worlds[world]["reseed_ticks"].extend(columns["tick"][reseed_events].tolist())
@@ -987,7 +1004,48 @@ def summarize(cfg, result, seeds, cohort_len: int, chunk: int = CHUNK) -> dict:
             "fraction_below_0_2": float(np.mean(values < 0.2)),
             "fraction_below_0_34": float(np.mean(values < 0.34)),
         }
+    budget_buckets: dict[int, dict] = {}
+    for data in result["worlds"]:
+        for tick in data["reseed_ticks"]:
+            bucket = int(tick) // 1000
+            entry = budget_buckets.setdefault(bucket, {"rescues": 0, "births": 0, "deaths": 0})
+            entry["rescues"] += 1
+        for _uid, (tick, reseed, _parent) in data["births"].items():
+            if not reseed:
+                bucket = int(tick) // 1000
+                budget_buckets.setdefault(bucket, {"rescues": 0, "births": 0, "deaths": 0})
+                budget_buckets[bucket]["births"] += 1
+        for row in data["deaths"]:
+            bucket = int(row[0]) // 1000
+            budget_buckets.setdefault(bucket, {"rescues": 0, "births": 0, "deaths": 0})
+            budget_buckets[bucket]["deaths"] += 1
+    per_1000 = [
+        {"start_tick": bucket * 1000, **budget_buckets[bucket]}
+        for bucket in sorted(budget_buckets)
+    ]
+    post_ramp = []
+    ramp_ticks = int(cfg.world.ramp_ticks)
+    for world, data in enumerate(result["worlds"]):
+        post_rescues = sum(1 for tick in data["reseed_ticks"] if tick >= ramp_ticks)
+        post_ramp.append(
+            {
+                "world": world,
+                "seed": int(seeds[world]),
+                "post_ramp_rescues": int(post_rescues),
+                "final_population": int(pop[-1, world]),
+            }
+        )
+    generation_bites = {}
+    for data in result["worlds"]:
+        for uid, gen in data["generation"].items():
+            key = str(int(gen))
+            entry = generation_bites.setdefault(key, {"bites_living": 0, "meat_animal": 0.0})
+            entry["bites_living"] += int(data["bites_living"].get(int(uid), 0))
+            entry["meat_animal"] += float(data["meat_animal"].get(int(uid), 0.0))
     return {
+        "per_1000": per_1000,
+        "post_ramp": post_ramp,
+        "generation_bites": generation_bites,
         "stock_by_species": stock_by_species,
         "end_population_rho_animal": rho_stats,
         "generation": generation_summary,
