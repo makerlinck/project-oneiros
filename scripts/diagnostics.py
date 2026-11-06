@@ -35,6 +35,7 @@ from life_sandbox.core import events as events_mod
 from life_sandbox.core.state import population
 from life_sandbox.core.step import SYSTEMS, _event_counts, step as engine_step
 from life_sandbox.core.struct import update
+from life_sandbox.world import fields as world_fields
 from life_sandbox.world.init import initial_state
 
 CHUNK = 128
@@ -45,9 +46,18 @@ def _wrap(angle):
     return (angle + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
 
+KNOB_MODE = "constant"
+AVOID_TOXIN = False
+
+
 def forager_think(state, cfg):
-    """Scripted forager: nearest bush, stay inside, bite when stomach is not full."""
-    del cfg
+    """Scripted forager: nearest bush, stay inside, bite when stomach is not full.
+
+    --knob adaptive also raises the metabolic knob when the skin temperature
+    difference says the environment is colder than the body (and lowers it in
+    the heat); --avoid-toxin ignores berry species whose current composition is
+    toxic.  Both are calibration-only variants of the same simple policy.
+    """
     creature = state.entities.creature
     bush = state.entities.bush
     pos = creature.transform.pos
@@ -55,6 +65,10 @@ def forager_think(state, cfg):
     delta = bush.transform.pos[None, :, :] - pos[:, None, :]
     distance = jnp.linalg.norm(delta, axis=-1)
     distance = jnp.where(bush.alive[None, :], distance, jnp.inf)
+    if AVOID_TOXIN:
+        species = bush.edible.kind
+        toxin_share = state.comp[:, C.TOXIN][species]
+        distance = jnp.where(toxin_share[None, :] > 0.05, jnp.inf, distance)
     distance = jnp.where(jnp.isfinite(distance), distance, 1e6)
     nearest = jnp.argmin(distance, axis=1)
     target = bush.transform.pos[nearest]
@@ -68,11 +82,17 @@ def forager_think(state, cfg):
     stomach = jnp.sum(creature.body.G, axis=1)
     hungry = stomach < 0.8 * 0.3
     zeros = jnp.zeros_like(theta)
+    if KNOB_MODE == "adaptive":
+        ambient, _ = world_fields.environment_at(state, cfg)
+        skin = ambient - creature.body.b
+        knob = jnp.clip(0.5 - 4.0 * skin, 0.0, 1.0)
+    else:
+        knob = jnp.full_like(theta, KNOB)
     outputs = jnp.stack(
         [
             jnp.where(in_range, -0.2, 1.0),  # approach, stop inside
             jnp.clip(error / 0.5, -1.0, 1.0),  # steer
-            jnp.full_like(theta, KNOB),  # metabolic knob
+            knob,  # metabolic knob
             jnp.where(in_range & facing & hungry, 1.0, 0.0),  # bite
             zeros,  # grab
             zeros,  # drop
@@ -309,11 +329,15 @@ def main() -> None:
     parser.add_argument("--tiny", action="store_true")
     parser.add_argument("--temperature-scale", type=float, default=None)
     parser.add_argument("--knob", type=float, default=0.5)
+    parser.add_argument("--knob-mode", choices=("constant", "adaptive"), default="constant")
+    parser.add_argument("--avoid-toxin", action="store_true")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
-    global KNOB
+    global KNOB, KNOB_MODE, AVOID_TOXIN
     KNOB = float(args.knob)
+    KNOB_MODE = args.knob_mode
+    AVOID_TOXIN = bool(args.avoid_toxin)
     cfg = design_config(args)
     seeds = [9300 + i for i in range(args.worlds)]
     step_fn = forager_step if args.arm == "forager" else engine_step
