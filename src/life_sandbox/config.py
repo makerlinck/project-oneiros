@@ -43,6 +43,9 @@ class WorldConfig:
     bush_regen_rate: float = 0.03
     bush_regen_base: float = 1e-4
     temperature_scale: float = 1.0
+    # Emergency reseed on population < 8 (§5.5).  Diagnostics set this off to
+    # observe the true dynamics without rescue.
+    reseed_enabled: bool = True
     founders: int = 64
     # Startup ramp (SANDBOX.md §9): environment conditions interpolate from a
     # permissive state (tick 0) to the target values at ramp_ticks.  Values are

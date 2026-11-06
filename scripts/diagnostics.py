@@ -490,6 +490,8 @@ def design_config(args) -> Config:
                 ramp_ticks=int(args.ramp_ticks),
             )
         )
+    if args.no_reseed:
+        cfg = cfg.replaced(world=replace(cfg.world, reseed_enabled=False))
     if args.founder_animal_logit is not None:
         cfg = cfg.replaced(
             body=replace(
@@ -517,6 +519,7 @@ def main() -> None:
     parser.add_argument("--min-stock", type=float, default=0.0)
     parser.add_argument("--avoid-hot", type=float, default=0.0)
     parser.add_argument("--founder-animal-logit", type=float, default=None)
+    parser.add_argument("--no-reseed", action="store_true")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 

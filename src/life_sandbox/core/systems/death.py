@@ -298,7 +298,10 @@ def _reseed(
 
     Fixed-shape branch: `n_seed = min(32, capacity)` candidates are always
     built; slots beyond the free count are dropped by the scatter mask.
+    Diagnostics can disable the emergency rescue with world.reseed_enabled.
     """
+    if not cfg.world.reseed_enabled:
+        return state, buffer
     creature = state.entities.creature
     capacity = creature.alive.shape[0]
     n_seed = min(RESEED_COUNT, capacity)

@@ -478,6 +478,17 @@ def test_death_cause_is_the_largest_decayed_loss():
     assert row["nutrient"] == -1
 
 
+def test_reseed_can_be_disabled_for_diagnostics():
+    from dataclasses import replace
+
+    cfg = small_cfg()
+    cfg = replace(cfg, world=replace(cfg.world, reseed_enabled=False))
+    result = run(initial_state(cfg), cfg, 20, collect_events=True)
+    kinds = result.events["kind"].tolist()
+    assert events.kind_code("reseed") not in kinds
+    assert events.kind_code("birth") not in kinds
+
+
 def test_reseed_records_birth_events():
     """Each reseeded individual also gets a birth event with reason=reseed."""
     cfg = small_cfg()
