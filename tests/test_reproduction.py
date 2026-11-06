@@ -20,17 +20,22 @@ from life_sandbox.core.hashing import state_hash
 from life_sandbox.core.state import empty
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems import reproduction
+from life_sandbox.world import init as world_init
 
 FLESH = jnp.asarray([0.3, 0.7, 0.0], jnp.float32)
 START_UID = 1000
 PARENT_RESERVES = (0.17, 0.17, 0.17)  # sum 0.51: just above theta_repro = 0.5
 
 
-def make_cfg(capacity: int = 40, *, randomize: bool = False) -> Config:
+def make_cfg(
+    capacity: int = 40, *, randomize: bool = False, from_reserves: bool = True
+) -> Config:
     return Config.default().replaced(
         capacities=Capacities(creature=capacity, bush=6, carcass=2, neutral=1),
         motion=MotionConfig(noise_scale=0.0),
-        reproduction=ReproductionConfig(randomize_genome=randomize),
+        reproduction=ReproductionConfig(
+            randomize_genome=randomize, tissue_from_reserves=from_reserves
+        ),
     )
 
 
@@ -113,6 +118,7 @@ def records(buffer) -> list[dict]:
             {
                 "kind": int(buffer.kind[i]),
                 "uid": int(buffer.uid[i]),
+                "parent_uid": int(buffer.parent_uid[i]),
                 "target_kind": int(buffer.target_kind[i]),
                 "target_uid": int(buffer.target_uid[i]),
                 "success": bool(buffer.success[i]),
@@ -150,7 +156,10 @@ def test_budget_caps_births_and_defers_the_rest():
         assert row["success"]
         assert row["target_kind"] == C.CREATURE
         assert row["target_uid"] == row["uid"]
+        assert row["parent_uid"] == C.NO_REF  # birth_defer: uid is the parent
         assert row["reason"] == events.reason_code("none")
+    for row in births:
+        assert row["parent_uid"] == row["target_uid"]  # birth: parent uid
     for slot in range(parents):
         parent_uid = int(cre.identity.uid[slot])
         if parent_uid in deferred_uids:
@@ -342,3 +351,130 @@ def test_randomize_genome_arm_compiles_and_matches_eager():
     assert jnp.array_equal(
         eager_out.entities.creature.genome.g[1], jit_out.entities.creature.genome.g[1]
     )
+
+
+def test_reserve_payment_keeps_adult_tissue():
+    """Default arm: B_child = 0.03*c_flesh comes from N; the adult B stays."""
+    cfg = make_cfg(8)
+    state = base_state(cfg)
+    parent_n = jnp.asarray([0.5, 0.5, 0.5])
+    parent_b = jnp.asarray([0.15, 0.35, 0.0])
+    state = add_parent(
+        state, cfg, 0, pos=(10.0, 10.0), uid=1,
+        reserves=tuple(parent_n), tissue=tuple(parent_b),
+    )
+    out, buffer = reproduction.apply(state, cfg)
+    births = of_kind(buffer, "birth")
+    assert len(births) == 1
+    assert births[0]["uid"] == START_UID
+    assert births[0]["parent_uid"] == 1
+    cre = out.entities.creature
+    tissue = reproduction.CHILD_TISSUE * FLESH
+    child_rho = world_init.diet_from_genome(cre.genome.g[1:2], cfg)[0]
+    expected_child_n = jnp.minimum(0.3 * child_rho, parent_n - tissue)
+    remaining = parent_n - tissue - expected_child_n
+    expected_loss = jnp.minimum(0.02 * jnp.ones(3) / 3.0, remaining)
+    assert jnp.array_equal(cre.body.B[0], parent_b)  # adult B untouched
+    assert jnp.allclose(cre.body.B[1], tissue, atol=1e-7)
+    assert jnp.allclose(cre.body.N[1], expected_child_n, atol=1e-6)
+    assert jnp.allclose(
+        cre.body.N[0],
+        parent_n - tissue - expected_child_n - expected_loss,
+        atol=1e-6,
+    )
+
+
+def test_reserve_payment_fails_without_reserve():
+    """One N component below B_child fails the birth with no_reserve (§5.5)."""
+    cfg = make_cfg(8)
+    state = base_state(cfg)
+    reserves = jnp.asarray([0.001, 0.5, 0.5])  # first < 0.03*0.3
+    tissue = jnp.asarray([0.15, 0.35, 0.0])
+    state = add_parent(
+        state, cfg, 0, pos=(10.0, 10.0), uid=9,
+        reserves=tuple(reserves), tissue=tuple(tissue),
+    )
+    out, buffer = reproduction.apply(state, cfg)
+    fails = of_kind(buffer, "birth_fail")
+    assert len(fails) == 1
+    assert fails[0]["reason"] == events.reason_code("no_reserve")
+    assert fails[0]["uid"] == 9
+    assert fails[0]["parent_uid"] == C.NO_REF
+    cre = out.entities.creature
+    assert not bool(cre.alive[1])
+    assert jnp.allclose(cre.body.N[0], reserves, atol=1e-7)
+    assert jnp.allclose(cre.body.B[0], tissue, atol=1e-7)
+
+
+def test_reserve_payment_allows_many_births():
+    """Without the B cap a fed parent can split many times in a row (§5.5)."""
+    cfg = make_cfg(8)
+    state = base_state(cfg)
+    parent_b = jnp.asarray([0.15, 0.35, 0.0])
+    state = add_parent(
+        state, cfg, 0, pos=(10.0, 10.0), uid=1,
+        reserves=(0.33, 0.33, 0.33), tissue=tuple(parent_b),
+    )
+    births = 0
+    for cycle in range(5):
+        cre = state.entities.creature
+        # Simulate feeding between births.
+        cre = update(
+            cre,
+            body=update(
+                cre.body, N=cre.body.N.at[0].set(jnp.asarray([0.33, 0.33, 0.33], jnp.float32))
+            ),
+        )
+        state = update(
+            state,
+            entities=update(state.entities, creature=cre),
+            tick=(state.tick + jnp.asarray(1, jnp.int32)),
+        )
+        out, buffer = reproduction.apply(state, cfg)
+        new_births = of_kind(buffer, "birth")
+        assert len(new_births) == 1, (
+            cycle,
+            [row["reason"] for row in of_kind(buffer, "birth_fail")],
+        )
+        assert jnp.array_equal(out.entities.creature.body.B[0], parent_b)
+        state = out
+        births += 1
+    assert births == 5
+    assert int(jnp.sum(state.entities.creature.alive)) == 6
+    assert int(state.uid_counter) == START_UID + 5
+
+
+def test_control_arm_keeps_old_tissue_payment():
+    """tissue_from_reserves=false reproduces the old B payment (A/B control)."""
+    cfg = make_cfg(8, from_reserves=False)
+    state = base_state(cfg)
+    parent_n = jnp.asarray([0.5, 0.5, 0.5])
+    parent_b = jnp.asarray([0.15, 0.35, 0.0])
+    state = add_parent(
+        state, cfg, 0, pos=(10.0, 10.0), uid=1,
+        reserves=tuple(parent_n), tissue=tuple(parent_b),
+    )
+    out, buffer = reproduction.apply(state, cfg)
+    assert len(of_kind(buffer, "birth")) == 1
+    cre = out.entities.creature
+    tissue = reproduction.CHILD_TISSUE * FLESH
+    child_rho = world_init.diet_from_genome(cre.genome.g[1:2], cfg)[0]
+    expected_child_n = jnp.minimum(0.3 * child_rho, parent_n)
+    remaining = parent_n - expected_child_n
+    expected_loss = jnp.minimum(0.02 * jnp.ones(3) / 3.0, remaining)
+    assert jnp.allclose(cre.body.N[1], expected_child_n, atol=1e-6)
+    assert jnp.allclose(
+        cre.body.N[0], parent_n - expected_child_n - expected_loss, atol=1e-6
+    )
+    assert jnp.allclose(cre.body.B[0], parent_b - tissue, atol=1e-7)
+
+    # The control arm still fails with no_tissue when B is too small.
+    fail_state = base_state(cfg)
+    fail_state = add_parent(
+        fail_state, cfg, 0, pos=(10.0, 10.0), uid=5,
+        reserves=(0.5, 0.5, 0.5), tissue=(0.001, 0.001, 0.0),
+    )
+    _, fail_buffer = reproduction.apply(fail_state, cfg)
+    fails = of_kind(fail_buffer, "birth_fail")
+    assert len(fails) == 1
+    assert fails[0]["reason"] == events.reason_code("no_tissue")

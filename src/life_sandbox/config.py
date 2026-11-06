@@ -162,6 +162,11 @@ class ReproductionConfig:
     # Control arm: every birth gets a fresh random genome instead of the parent's
     # genome plus mutation.
     randomize_genome: bool = False
+    # Default: the child's tissue B_child = 0.03*c_flesh is paid from the
+    # parent's reserves N (same rule as growth, SANDBOX.md §5.5), so an adult's
+    # B is not consumed by reproduction.  False keeps the old B payment as an
+    # A/B control.
+    tissue_from_reserves: bool = True
 
 
 @dataclass(frozen=True)

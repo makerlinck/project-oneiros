@@ -35,14 +35,16 @@ from life_sandbox.core import components as C
 from life_sandbox.core import events as events_mod
 from life_sandbox.core.state import population
 from life_sandbox.core.step import SYSTEMS, _event_counts, step as engine_step
+from life_sandbox.core.systems import reproduction as reproduction_system
 from life_sandbox.core.struct import update
 from life_sandbox.world.init import diet_from_genome, initial_state
 
 CHUNK = 128
 A_MATURE = 100
+NUTRIENT_LABELS = ("plant", "animal", "toxin")
 KNOB = 0.5
-KNOB_MODE = "true-b"
-BITE_FORCE = 0.5
+KNOB_MODE = "zero"
+BITE_FORCE = 1.0
 AVOID_TOXIN = False
 MIN_STOCK = 0.0
 AVOID_HOT = 0.0
@@ -111,32 +113,37 @@ def forager_think(state, cfg):
     self_radius = creature.shape.radius
     n_creature = pos.shape[0]
 
-    # Diet-aware species choice: animal-heavy diets go for nuts (kind 2),
-    # plant-heavy diets for species 0, the rest for species 1.
-    diet = diet_from_genome(creature.genome.g, cfg)
-    target_species = jnp.where(
-        diet[:, C.ANIMAL] > 0.35,
-        2,
-        jnp.where(diet[:, C.PLANT] >= 0.5, 0, 1),
-    )
+    # Probe v2 (2026-11-06 review): a species is eligible only if its animal
+    # supply covers the animal demand with a 1.3x margin at full digestion
+    # (0.0135/tick * absorption 0.9*sqrt(rho_A) * c_A >= 1.3*rho_A).
+    diet = diet_from_genome(creature.genome.g, cfg)  # (N, 3)
+    rho_animal = diet[:, C.ANIMAL]
+    animal_share = state.comp[C.ANIMAL][bush.edible.kind]  # per bush slot
+    supplied = 0.0135 * 0.9 * jnp.sqrt(rho_animal)[:, None] * animal_share[None, :]
+    eligible = bush.alive[None, :] & (supplied >= 1.3 * rho_animal[:, None])
 
     delta = bush.transform.pos[None, :, :] - pos[:, None, :]
-    distance = jnp.linalg.norm(delta, axis=-1)
-    distance = jnp.where(bush.alive[None, :], distance, jnp.inf)
-    preferred = bush.alive[None, :] & (bush.edible.kind[None, :] == target_species[:, None])
-    distance = _prefer(preferred, distance)
-    if AVOID_TOXIN:
-        species = bush.edible.kind
-        toxin_share = state.comp[:, C.TOXIN][species]
-        distance = _prefer(toxin_share[None, :] <= 0.05, distance)
-    if AVOID_HOT > 0.0:
-        scaled = cfg.world.temperature_scale * (
-            -2.0 + 4.0 * bush.transform.pos[:, 1] / cfg.world.height
+    distance0 = jnp.where(bush.alive[None, :], jnp.linalg.norm(delta, axis=-1), jnp.inf)
+    stocked = bush.edible.stock >= 0.3
+
+    def _pick(candidates, distance0, stocked):
+        base = jnp.where(candidates, distance0, jnp.inf)
+        stocked_base = jnp.where(candidates & stocked[None, :], distance0, jnp.inf)
+        picked = jnp.where(
+            jnp.any(jnp.isfinite(stocked_base), axis=1, keepdims=True), stocked_base, base
         )
-        distance = _prefer(jnp.abs(scaled)[None, :] <= AVOID_HOT, distance)
-    if MIN_STOCK > 0.0:
-        distance = _prefer(bush.edible.stock[None, :] >= MIN_STOCK, distance)
-    distance = jnp.where(jnp.isfinite(distance), distance, 1e6)
+        return jnp.where(jnp.any(jnp.isfinite(picked), axis=1, keepdims=True), picked, distance0)
+
+    pick = _pick(eligible, distance0, stocked)
+    slot0 = jnp.argmin(pick, axis=1)
+    toxic_share = state.comp[C.TOXIN][bush.edible.kind]
+    own_toxic = toxic_share[bush.edible.kind[slot0]] > 0.05
+    needs_toxin = creature.body.N[:, C.TOXIN] >= 0.5 * diet[:, C.TOXIN]
+    switch = own_toxic & needs_toxin
+    non_toxic = eligible & (toxic_share[None, :] <= 0.05)
+    alternative = _pick(non_toxic, distance0, stocked)
+    pick = jnp.where(switch[:, None], alternative, pick)
+    distance = jnp.where(jnp.isfinite(pick), pick, 1e6)
     bush_slot = jnp.argmin(distance, axis=1)
     target = bush.transform.pos[bush_slot]
     target_radius = bush.shape.radius[bush_slot]
@@ -174,7 +181,9 @@ def forager_think(state, cfg):
     )
     bite_ok = hungry & in_range & facing & bite_target_is_bush
 
-    if KNOB_MODE == "true-b":
+    if KNOB_MODE == "zero":
+        knob = jnp.zeros_like(theta)
+    elif KNOB_MODE == "true-b":
         body_temperature = creature.body.b
         knob = jnp.where(
             body_temperature > 0.3,
@@ -268,22 +277,30 @@ def _flatten(buffers, world: int) -> dict:
         "same_lineage",
         "reason",
         "loss",
+        "parent_uid",
     ):
         columns[name] = np.asarray(getattr(buffers, name))[:, world][mask]
     return columns
 
 
-def run_worlds(step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUNK) -> dict:
+def run_worlds(
+    step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUNK, track: bool = False
+) -> dict:
     states = _stack([initial_state(cfg, seed=seed) for seed in seeds])
     worlds = [
         {
-            "births": {},        # uid -> (tick, reseed: bool)
+            "births": {},        # uid -> (tick, reseed: bool, parent_uid)
             "deaths": [],        # (tick, uid, cause, nutrient, same_lineage, loss[5])
             "bites": Counter(),
             "reseeds": 0,
+            "birth_fail": Counter(),
+            "birth_fail_parents": {},
+            "births_by_parent": Counter(),
         }
         for _ in seeds
     ]
+    tracker = [[] for _ in seeds] if track else None
+    dropped_events = 0
     totals = np.zeros((len(seeds), len(events_mod.EVENT_KINDS)), dtype=np.int64)
     ledger = {
         "inflow": np.zeros((len(seeds), C.N_INFLOW_CATEGORIES, C.N_NUTRIENTS), dtype=np.float64),
@@ -298,6 +315,7 @@ def run_worlds(step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUN
     for _ in range(ticks // chunk):
         states, counts, buffers, ledgers = jitted(states)
         totals += np.asarray(counts)
+        dropped_events += int(np.asarray(buffers.dropped).sum())
         for name in ledger:
             ledger[name] += np.asarray(getattr(ledgers, name), dtype=np.float64).sum(axis=0)
         if collect:
@@ -305,12 +323,22 @@ def run_worlds(step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUN
                 columns = _flatten(buffers, world)
                 births = columns["kind"] == events_mod.kind_code("birth")
                 reseed_birth = births & (columns["reason"] == events_mod.reason_code("reseed"))
-                for tick, uid, reseed in zip(
+                for tick, uid, reseed, parent in zip(
                     columns["tick"][births].tolist(),
                     columns["uid"][births].tolist(),
                     reseed_birth[births].tolist(),
+                    columns["parent_uid"][births].tolist(),
                 ):
-                    worlds[world]["births"][int(uid)] = (int(tick), bool(reseed))
+                    worlds[world]["births"][int(uid)] = (int(tick), bool(reseed), int(parent))
+                    if int(parent) >= 0:
+                        worlds[world]["births_by_parent"][int(parent)] += 1
+                fails = columns["kind"] == events_mod.kind_code("birth_fail")
+                for uid, reason in zip(
+                    columns["uid"][fails].tolist(), columns["reason"][fails].tolist()
+                ):
+                    name = events_mod.REASONS[int(reason)]
+                    worlds[world]["birth_fail"][name] += 1
+                    worlds[world]["birth_fail_parents"].setdefault(name, set()).add(int(uid))
                 deaths = columns["kind"] == events_mod.kind_code("death")
                 for tick, uid, cause, nutrient, same, loss in zip(
                     columns["tick"][deaths].tolist(),
@@ -331,6 +359,25 @@ def run_worlds(step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUN
                 worlds[world]["reseeds"] += int(
                     np.sum(columns["kind"] == events_mod.kind_code("reseed"))
                 )
+        if track:
+            for world in range(len(seeds)):
+                wstate = _world(states, world)
+                creat = wstate.entities.creature
+                bush = wstate.entities.bush
+                diet = np.asarray(diet_from_genome(creat.genome.g, cfg))
+                ratio = np.asarray(creat.body.N) / np.maximum(diet, 1e-6)
+                tracker[world].append(
+                    {
+                        "tick": int(states.tick[world]),
+                        "uid": np.asarray(creat.identity.uid),
+                        "alive": np.asarray(creat.alive),
+                        "sum_n": np.asarray(jnp.sum(creat.body.N, axis=1)),
+                        "theta": np.asarray(reproduction_system.theta_repro(creat, cfg)),
+                        "limiting": np.argmin(ratio, axis=1),
+                        "stock": np.asarray(bush.edible.stock),
+                        "bush_alive": np.asarray(bush.alive),
+                    }
+                )
         populations.append([int(population(_world(states, i))) for i in range(len(seeds))])
     wall = time.perf_counter() - started
     return {
@@ -340,6 +387,8 @@ def run_worlds(step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUN
         "ledger": ledger,
         "worlds": worlds,
         "states": states,
+        "tracker": tracker,
+        "dropped_events": dropped_events,
     }
 
 
@@ -377,7 +426,7 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
                 bite_deaths["same_lineage" if same else "other"] += 1
             born = data["births"].get(uid)
             if born is not None:
-                born_tick, reseed_born = born
+                born_tick, reseed_born, _parent = born
                 age = tick - born_tick
                 (ages_reseed if reseed_born else ages_reproduction).append(age)
                 if not reseed_born:
@@ -396,7 +445,7 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
                     entry["lifespans"].append(age)
                     entry["lifetime_ticks"] += age
                     entry["died"] += 1
-        for uid, (born_tick, reseed_born) in data["births"].items():
+        for uid, (born_tick, reseed_born, _parent) in data["births"].items():
             if reseed_born:
                 continue
             key = int(born_tick // cohort_len)
@@ -416,7 +465,7 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
             entry["bites"] += bites
             if bites:
                 entry["biters"] += 1
-        born_groups = Counter(reseed for _, reseed in data["births"].values())
+        born_groups = Counter(reseed for _, reseed, _parent in data["births"].values())
         per_world.append(
             {
                 "seed": seeds[world],
@@ -462,7 +511,95 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
         "transfer_to": np.asarray(result["ledger"]["transfer_to"]).sum(axis=0).tolist(),
         "digested": np.asarray(result["ledger"]["digested"]).sum(axis=0).tolist(),
     }
+    birth_fail_counts: Counter = Counter()
+    birth_fail_parents: dict = {}
+    births_by_parent: Counter = Counter()
+    for data in result["worlds"]:
+        birth_fail_counts.update(data["birth_fail"])
+        for reason, parents in data["birth_fail_parents"].items():
+            birth_fail_parents.setdefault(reason, set()).update(parents)
+        births_by_parent.update(data["births_by_parent"])
+    births_total = int(sum(births_by_parent.values()))
+    individuals = int(cfg.world.founders) + int(
+        sum(len(data["births"]) for data in result["worlds"])
+    )
+    r0_values = [int(value) for value in births_by_parent.values()]
+    first_birth_ages = []
+    for data in result["worlds"]:
+        first = {}
+        for uid, (tick, _reseed, parent) in data["births"].items():
+            if parent >= 0:
+                first[parent] = min(first.get(parent, tick), tick)
+        for parent, first_tick in first.items():
+            born = data["births"].get(parent)
+            if born is not None:
+                first_birth_ages.append(int(first_tick) - int(born[0]))
+    r0 = {
+        "births_total": births_total,
+        "individuals_ever": individuals,
+        "mean_r0_all_individuals": births_total / max(individuals, 1),
+        "reproducing_parents": len(r0_values),
+        "mean_r0_reproducing": float(np.mean(r0_values)) if r0_values else None,
+        "max_r0": max(r0_values) if r0_values else 0,
+        "fraction_reproducing_with_2plus": (
+            float(np.mean([value >= 2 for value in r0_values])) if r0_values else None
+        ),
+        "fraction_reproducing_with_3plus": (
+            float(np.mean([value >= 3 for value in r0_values])) if r0_values else None
+        ),
+    }
+    track_summary = None
+    if result.get("tracker"):
+        max_ratio, ever_above, above_fractions, limiting_counts = [], 0, [], Counter()
+        stock_means, low_stock = [], []
+        for samples in result["tracker"]:
+            stats = {}
+            for sample in samples:
+                alive = sample["alive"]
+                stock = sample["stock"][sample["bush_alive"]]
+                if stock.size:
+                    stock_means.append(float(np.mean(stock)))
+                    low_stock.append(float(np.mean(stock < 0.1)))
+                for index in np.nonzero(alive)[0]:
+                    uid = int(sample["uid"][index])
+                    ratio = float(sample["sum_n"][index] / max(float(sample["theta"][index]), 1e-6))
+                    entry = stats.setdefault(
+                        uid, {"max": 0.0, "above": 0, "n": 0, "lim": Counter()}
+                    )
+                    entry["max"] = max(entry["max"], ratio)
+                    entry["above"] += int(ratio >= 1.0)
+                    entry["n"] += 1
+                    entry["lim"][int(sample["limiting"][index])] += 1
+            for entry in stats.values():
+                max_ratio.append(entry["max"])
+                ever_above += int(entry["above"] > 0)
+                above_fractions.append(entry["above"] / max(entry["n"], 1))
+                limiting_counts[entry["lim"].most_common(1)[0][0]] += 1
+        track_summary = {
+            "individuals_tracked": len(max_ratio),
+            "median_max_sumN_over_theta": float(np.median(max_ratio)) if max_ratio else None,
+            "fraction_ever_above_theta": ever_above / max(len(max_ratio), 1),
+            "mean_fraction_time_above_theta": (
+                float(np.mean(above_fractions)) if above_fractions else None
+            ),
+            "limiting_nutrient_most_common": {
+                NUTRIENT_LABELS[key]: value for key, value in limiting_counts.items()
+            },
+            "bush_stock_mean": float(np.mean(stock_means)) if stock_means else None,
+            "bush_stock_below_0_1_fraction": float(np.mean(low_stock)) if low_stock else None,
+        }
     return {
+        "r0": r0,
+        "first_birth_age": {
+            "count": len(first_birth_ages),
+            "median": float(np.median(first_birth_ages)) if first_birth_ages else None,
+        },
+        "birth_fail": {
+            "counts": dict(birth_fail_counts),
+            "unique_parents": {key: len(value) for key, value in birth_fail_parents.items()},
+        },
+        "track": track_summary,
+        "dropped_events": int(result.get("dropped_events", 0)),
         "event_counts": event_counts,
         "ledger_totals": ledger_totals,
         "population_rows": pop.tolist(),
@@ -513,6 +650,12 @@ def design_config(args) -> Config:
         )
     if args.base_metabolism is not None:
         cfg = cfg.replaced(body=replace(cfg.body, base_metabolism=float(args.base_metabolism)))
+    if args.tissue_from_b:
+        cfg = cfg.replaced(
+            reproduction=replace(cfg.reproduction, tissue_from_reserves=False)
+        )
+    if args.founders is not None:
+        cfg = cfg.replaced(world=replace(cfg.world, founders=int(args.founders)))
     if args.no_reseed:
         cfg = cfg.replaced(world=replace(cfg.world, reseed_enabled=False))
     if args.founder_animal_logit is not None:
@@ -544,6 +687,9 @@ def main() -> None:
     parser.add_argument("--founder-animal-logit", type=float, default=None)
     parser.add_argument("--no-reseed", action="store_true")
     parser.add_argument("--base-metabolism", type=float, default=None)
+    parser.add_argument("--founders", type=int, default=None)
+    parser.add_argument("--tissue-from-b", action="store_true")
+    parser.add_argument("--track", action="store_true")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -556,7 +702,7 @@ def main() -> None:
     cfg = design_config(args)
     seeds = [9300 + i for i in range(args.worlds)]
     step_fn = forager_step if args.arm == "forager" else engine_step
-    result = run_worlds(step_fn, cfg, seeds, args.ticks, collect=True)
+    result = run_worlds(step_fn, cfg, seeds, args.ticks, collect=True, track=args.track)
     summary = summarize(cfg, result, seeds, args.cohort)
     summary["arm"] = args.arm
     summary["probe"] = {
@@ -589,6 +735,11 @@ def main() -> None:
         "deaths",
         "reseeds",
         "population_mean",
+        "r0",
+        "birth_fail",
+        "first_birth_age",
+        "track",
+        "dropped_events",
         "death_causes",
         "death_loss_mean",
         "lifespan_reproduction",

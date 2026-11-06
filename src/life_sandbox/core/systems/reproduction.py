@@ -9,16 +9,20 @@ Python scalars, and the expensive branch is entered through `jax.lax.cond`.
 A creature splits automatically when SANDBOX.md §5.5 holds:
 sum(N) >= theta_repro (genome, clipped to [0.5, 1]) and mu = 1.
 
-Parent payment, in the documented order:
-1. B_child = 0.03*c_flesh paid from the parent's tissue; if any component is
-   missing the birth fails with `no_tissue`;
-2. 0.3*rho_child reserves, component-wise "as much as the parent has";
+Parent payment, in the documented order (§5.5):
+1. B_child = 0.03*c_flesh.  Default (cfg.reproduction.tissue_from_reserves =
+   true, the physical rule shared with growth §5.2): paid from the parent's
+   reserves N; if any component is missing the birth fails with `no_reserve`,
+   and the adult's B is untouched.  A/B control arm (false): paid from the
+   parent's tissue B with `no_tissue` (old behaviour);
+2. 0.3*rho_child reserves from the remaining N, component-wise "as much as the
+   parent has";
 3. a birth loss of 0.02*rho_parent (whatever is left is taken).
 
-Child: mass 0.3, radius 0.5*sqrt(0.3) (§4.2), empty stomach, parent's core
-temperature, integrity 1, random heading, genome mutated by
+Child: mass 0.3, radius 0.5*sqrt(0.3) (§4.2), B = B_child, empty stomach,
+parent's core temperature, integrity 1, random heading, genome mutated by
 g' = g + sigma_block*N(0, 1) (§6.3), zero hidden state, fast weights, pain,
-damage and grip.  Position: behind the parent at r_parent + r_child, trying
+damage and grip.  Birth events carry uid = child and parent_uid = parent.  Position: behind the parent at r_parent + r_child, trying
 +-45, +-90 and +-135 degrees; a candidate is occupied when it overlaps a living
 creature, a carcass or a neutral object (creatures pass through bushes, §4.2),
 or leaves the world rectangle.  Free slots are assigned in creature-slot order.
@@ -27,9 +31,10 @@ Documented decisions (SANDBOX.md is silent):
 - Occupancy is checked against entities alive at the start of reproduction;
   siblings born in the same tick are not checked against each other, so two
   simultaneous births may overlap for one tick until the collision pass.
-- A parent whose tissue is insufficient fails with `no_tissue`; a parent with
-  no free candidate position, or with no free creature slot left in slot
-  order, fails with `no_room`.  Failed births consume no slot, uid or payment.
+- A parent that cannot pay B_child fails with `no_reserve` (default arm) or
+  `no_tissue` (control arm); a parent with no free candidate position, or with
+  no free creature slot left in slot order, fails with `no_room`.  Failed
+  births consume no slot, uid or payment.
 - Mutation scales come from brain/genome.mutation_sigmas (§6.3), and genome /
   fast-weight widths come from brain/genome.layout(cfg): they are derived from
   H, D, M and N_OUT, never configured by hand.
@@ -180,11 +185,20 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     budgeted = eligible_mask & (eligible_rank >= 0) & (eligible_rank < B_MAX)
     deferred = eligible_mask & ~budgeted
 
-    # Parent payment 1: tissue.
+    # Parent payment 1 (§5.5): B_child = 0.03*c_flesh.
+    # Default arm: paid from reserves N, same rule as growth (§5.2); a missing
+    # component fails with reason no_reserve.  A/B control arm
+    # (cfg.reproduction.tissue_from_reserves = false): old payment from tissue B
+    # with reason no_tissue.
     flesh = jnp.asarray(C.FLESH_COMP, dtype=jnp.float32)
     tissue_cost = CHILD_TISSUE * flesh
     parent_body = creature.body
-    tissue_ok = jnp.all(parent_body.B >= tissue_cost[None, :], axis=1)
+    if cfg.reproduction.tissue_from_reserves:
+        payment_ok = jnp.all(parent_body.N >= tissue_cost[None, :], axis=1)
+        payment_reason = events.reason_code("no_reserve")
+    else:
+        payment_ok = jnp.all(parent_body.B >= tissue_cost[None, :], axis=1)
+        payment_reason = events.reason_code("no_tissue")
 
     # Child position: first free candidate in the documented order.
     positions, free_position = _candidate_positions(state, cfg, slots)
@@ -197,7 +211,7 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
         ~creature.alive, size=capacity, fill_value=capacity
     )[0].astype(jnp.int32)
     free_count = jnp.sum(~creature.alive).astype(jnp.int32)
-    tentative = budgeted & tissue_ok & free_position_any
+    tentative = budgeted & payment_ok & free_position_any
     tentative_rank = jnp.cumsum(tentative.astype(jnp.int32)) - 1
     success = tentative & (tentative_rank < free_count)
     success_rank = jnp.cumsum(success.astype(jnp.int32)) - 1
@@ -246,15 +260,20 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     # Parent payment 2-3: reserves and birth loss (computed per birth, then
     # expanded back onto the parent rows for the payment scatter).
     child_diet_by_rank = world_init.diet_from_genome(child_genome_by_rank, cfg)
+    parent_n_by_rank = parent_body.N[parent_by_rank]
+    tissue_per_birth = jnp.broadcast_to(tissue_cost[None, :], (B_MAX, C.N_NUTRIENTS))
+    if cfg.reproduction.tissue_from_reserves:
+        reserves_available = jnp.maximum(parent_n_by_rank - tissue_per_birth, 0.0)
+    else:
+        reserves_available = parent_n_by_rank
     child_reserves_by_rank = jnp.minimum(
-        CHILD_RESERVE_FRACTION * child_diet_by_rank,
-        parent_body.N[parent_by_rank],
+        CHILD_RESERVE_FRACTION * child_diet_by_rank, reserves_available
     )
     parent_rho_by_rank = world_init.diet_from_genome(
         creature.genome.g[parent_by_rank], cfg
     )
     remaining_by_rank = jnp.maximum(
-        parent_body.N[parent_by_rank] - child_reserves_by_rank, 0.0
+        reserves_available - child_reserves_by_rank, 0.0
     )
     birth_loss_by_rank = jnp.minimum(BIRTH_LOSS * parent_rho_by_rank, remaining_by_rank)
     rank_in_range = jnp.arange(B_MAX, dtype=jnp.int32) < num_success
@@ -263,10 +282,19 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     )
     child_reserves = child_reserves_by_rank[compact_index]
     birth_loss = birth_loss_by_rank[compact_index]
-    parent_n = parent_body.N - jnp.where(
-        success[:, None], child_reserves + birth_loss, 0.0
-    )
-    parent_b = parent_body.B - jnp.where(success[:, None], tissue_cost[None, :], 0.0)
+    if cfg.reproduction.tissue_from_reserves:
+        # The adult B is untouched; the child's tissue comes out of N.
+        parent_n = parent_body.N - jnp.where(
+            success[:, None], tissue_cost[None, :] + child_reserves + birth_loss, 0.0
+        )
+        parent_b = parent_body.B
+    else:
+        parent_n = parent_body.N - jnp.where(
+            success[:, None], child_reserves + birth_loss, 0.0
+        )
+        parent_b = parent_body.B - jnp.where(
+            success[:, None], tissue_cost[None, :], 0.0
+        )
 
     # Child records.
     zero_like_uids = jnp.zeros((capacity,), dtype=jnp.int32)
@@ -479,8 +507,8 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     # Every eligible parent reports exactly one event: birth, birth_fail, or
     # birth_defer when the per-tick budget is full (C5).
     reason = jnp.where(
-        ~tissue_ok,
-        jnp.asarray(events.reason_code("no_tissue"), jnp.int8),
+        ~payment_ok,
+        jnp.asarray(payment_reason, jnp.int8),
         jnp.asarray(events.reason_code("no_room"), jnp.int8),
     )
     reason = jnp.where(
@@ -496,6 +524,10 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
         ),
     )
     event_uid = jnp.where(success, child_uid, creature.identity.uid)
+    # Only a birth carries parent_uid (birth_fail already has uid = parent).
+    event_parent_uid = jnp.where(
+        success, creature.identity.uid, jnp.asarray(C.NO_REF, jnp.int32)
+    )
     event_x = jnp.where(success, child_position[:, 0], creature.transform.pos[:, 0])
     event_y = jnp.where(success, child_position[:, 1], creature.transform.pos[:, 1])
     buffer = append_events_batch(
@@ -504,6 +536,7 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
         kind=event_kind,
         tick=tick,
         uid=event_uid,
+        parent_uid=event_parent_uid,
         target_kind=jnp.full((capacity,), C.CREATURE, jnp.int32),
         target_uid=creature.identity.uid,
         x=event_x,

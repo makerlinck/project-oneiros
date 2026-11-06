@@ -59,12 +59,16 @@ REASONS: tuple[str, ...] = (
     "not_edible",
     # A birth that came from the reseed rescue (§5.5), not from reproduction.
     "reseed",
+    # Reproduction: the parent cannot pay B_child from its reserves (§5.5).
+    "no_reserve",
 )
 
 _ARRAY_FIELDS = (
     "kind",
     "tick",
     "uid",
+    # Birth only: the parent's uid (birth_fail uses uid = parent instead).
+    "parent_uid",
     "target_kind",
     "target_uid",
     "same_lineage",
@@ -102,6 +106,8 @@ class EventBuffer:
     kind: jax.Array
     tick: jax.Array
     uid: jax.Array
+    # Birth only: the parent's uid (NO_REF for every other event kind).
+    parent_uid: jax.Array
     target_kind: jax.Array
     target_uid: jax.Array
     same_lineage: jax.Array
@@ -128,6 +134,7 @@ def empty(cfg) -> EventBuffer:
         kind=jnp.zeros(capacity, dtype=jnp.int8),
         tick=jnp.zeros(capacity, dtype=jnp.int32),
         uid=jnp.zeros(capacity, dtype=jnp.int32),
+        parent_uid=jnp.full(capacity, NO_REF, dtype=jnp.int32),
         target_kind=jnp.full(capacity, NO_REF, dtype=jnp.int32),
         target_uid=jnp.zeros(capacity, dtype=jnp.int32),
         same_lineage=jnp.zeros(capacity, dtype=jnp.bool_),
@@ -160,6 +167,8 @@ def append(buffer: EventBuffer, **values) -> EventBuffer:
                 value = True
             elif name == "nutrient":
                 value = -1
+            elif name == "parent_uid":
+                value = NO_REF
             elif array.ndim > 1:
                 value = jnp.zeros(array.shape[1:], dtype=array.dtype)
             else:

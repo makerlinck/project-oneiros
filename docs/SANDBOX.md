@@ -423,8 +423,9 @@ c_tot = b·(1 + 3k²)·(1 + 衰老加成)·(睡眠时 × 0.5)·m^0.75
 - **繁殖条件：** `Σ N ≥ θ_repro`（来自基因组，裁剪到 [0.5, 1]），且 μ = 1。满足时自动分裂，不需要专门的动作。
   - **位置：** 子代放在亲代身后，距离为 r_亲 + r_子。如果被占，依次尝试 ±45°、±90°、±135°。都被占时，出生失败，记录事件。
   - **亲代的支付：**
-    - 先按 c_flesh 的比例支付子代的身体组织 `B_child = 0.03·c_flesh`。不够时，出生失败，记录原因。
-    - 再按 `0.3·ρ_子` 支付子代的初始储量，哪一类不够就少给。
+    - **先从亲代储量 N 中按 c_flesh 的比例支付子代的身体组织** `B_child = 0.03·c_flesh`（与 §5.2 生长同一规则；成体的 B 不再被繁殖消耗）。任一类储量不够时，出生失败，原因记 `no_reserve`。
+    - 再按 `0.3·ρ_子` 从剩余 N 中支付子代的初始储量，哪一类不够就少给。
+    - （2026-11-06 澄清：原表述没有写清从 B 还是 N 支付，实现方按 B 支付，导致一生最多繁殖 3 次。现按本条执行；`reproduction.tissue_from_reserves = false` 仅保留为 A/B 对照。）
     - 另外按自身 ρ 的比例支付 0.02 的出生损耗。
   - **子代：** 质量 0.3；胃为空；朝向用 reproduce 系统的 key 随机决定；基因组按 6.3 节变异；隐状态和可塑权重从零开始。对照臂 `reproduction.randomize_genome = true` 时，子代基因组改为全新随机抽样（§6.3 的初始化表），用来检验遗传的必要性（§9 M1）。
 - **出生预算与变异噪声（C5）。** 每个世界每 tick 最多 `B_MAX = 16` 个出生：成熟且达到阈值的亲代按 reproduce key 的随机排列排序，前 B_MAX 个真正分裂，其余本 tick 顺延（不消耗胎次），每个顺延的亲代发一条 `birth_defer` 事件。变异噪声按子代生成，key = `fold_in(reproduce_key, 子代 uid)`，所以一个出生的基因组只取决于 (reproduce_key, 子代 uid)，不依赖同 tick 的其他出生；每 tick 至多 B_MAX × 基因组宽度 份噪声，而不是"容量 × 基因组宽度"。B_MAX 是标定量（初值 16）。
@@ -669,7 +670,7 @@ W_slow 的初值取自基因组，清醒时不变；睡眠中巩固：W_slow += 
 | 表 | 粒度 | 主要字段 |
 |---|---|---|
 | `runs` | 每次运行 | run_id、mode（confirmatory/exploratory/intervention）、prereg_id、code_commit、config_hash、种子、起止时间、GPU、最终状态哈希 |
-| `events` | 每个事件 | world、tick、type、uid、目标原型、target_uid、是否同一谱系、x、y、取走的 Δn[3]、吸收量[3]、ΔX、伤害、cause、缺哪类营养（nutrient，仅死亡事件）、衰减损失向量（loss[5]，仅死亡事件）、成败与原因。重播种个体也写 birth 事件，reason = reseed。type 包括 birth、birth_fail、death、bite、grab、grab_fail、drop、escape、toxin_switch、reseed、sleep_start、sleep_end（注明自己醒来还是被唤醒、回放是否完成）、recall（深度与读到的帧数） |
+| `events` | 每个事件 | world、tick、type、uid、目标原型、target_uid、是否同一谱系、x、y、取走的 Δn[3]、吸收量[3]、ΔX、伤害、cause、缺哪类营养（nutrient，仅死亡事件）、衰减损失向量（loss[5]，仅死亡事件）、父代 uid（parent_uid，仅 birth 事件；出生失败时 uid 即亲代）、成败与原因。重播种个体也写 birth 事件，reason = reseed。type 包括 birth、birth_fail、death、bite、grab、grab_fail、drop、escape、toxin_switch、reseed、sleep_start、sleep_end（注明自己醒来还是被唤醒、回放是否完成）、recall（深度与读到的帧数） |
 | `lives` | 每个个体一行 | uid、parent_uid、lineage_id、generation、出生与死亡 tick、死因、后代数、食性 ρ、一生按来源（灌木各种类、尸体、活体）和按营养类型分的摄入与吸收、被咬次数、咬活体次数、被搬运次数、搬运他物次数、基因组或基因组指针 |
 | `world_ts` | 每 k_ts 个 tick | 种群数；出生数；按死因分的死亡数；平均 ΣN；平均 b；浆果总库存；尸体数；食性分布（ρ 的直方图）；食物网计数（各食性区间之间的咬与吸收）；槽位上限是否被触及；性状的均值与方差 |
 | `focal_traces` | 焦点个体，每 tick | uid、tick、s (D)、ŝ (D)、h (H)、各单元 \|ΔW^fast\|、m (M)、out (6)、痛觉各源强度 a[9]、G[3]、N[3]、I、X、b、p、v、ω、pos、θ、持有物的原型和 uid、S、asleep、回想深度 d、队列占用与强度分布 |

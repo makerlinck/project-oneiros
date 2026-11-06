@@ -14,11 +14,19 @@ import jax.numpy as jnp
 import pytest
 
 from life_sandbox.brain.genome import layout as brain_layout
-from life_sandbox.config import BodyConfig, Capacities, Config, MotionConfig, WorldConfig
+from life_sandbox.config import (
+    BodyConfig,
+    Capacities,
+    Config,
+    MotionConfig,
+    ReproductionConfig,
+    WorldConfig,
+)
 from life_sandbox.core import components as C, events
 from life_sandbox.core.state import empty
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems import death, metabolism, reproduction
+from life_sandbox.world import init as world_init
 
 N = 4
 FLESH = jnp.asarray([0.3, 0.7, 0.0], jnp.float32)
@@ -480,10 +488,12 @@ def test_acute_pain_from_bite_injury():
 
 
 def test_birth_payment_and_child_setup():
-    """Parent pays B_child, reserves and the birth loss (§5.5)."""
+    """Default arm pays B_child and reserves from N; adult B is untouched (§5.5)."""
     cfg = small_cfg()
+    parent_n = jnp.asarray([0.5, 0.5, 0.5])
+    parent_b = jnp.asarray([0.15, 0.35, 0.0])
     state = body_state(
-        cfg, rho=(0.2, 0.5, 0.3), reserves=(0.5, 0.5, 0.5), tissue=(0.15, 0.35, 0.0)
+        cfg, rho=(0.2, 0.5, 0.3), reserves=tuple(parent_n), tissue=tuple(parent_b)
     )
     out, buffer = reproduction.apply(state, cfg)
     cre = out.entities.creature
@@ -493,21 +503,25 @@ def test_birth_payment_and_child_setup():
     assert float(cre.shape.mass[1]) == pytest.approx(0.3, abs=1e-7)
     assert jnp.allclose(cre.body.B[1], 0.03 * FLESH, atol=1e-7)
     assert jnp.allclose(cre.body.G[1], 0.0, atol=1e-7)
-    child_rho = jnp.asarray([0.2, 0.5, 0.3])  # child genome ~ parent genome
-    expected_child_n = jnp.minimum(0.3 * child_rho, jnp.asarray([0.5, 0.5, 0.5]))
-    assert jnp.allclose(cre.body.N[1], expected_child_n, atol=1e-2)
-    expected_parent_n = (
-        jnp.asarray([0.5, 0.5, 0.5])
-        - expected_child_n
-        - 0.02 * jnp.asarray([0.2, 0.5, 0.3])
+    # B_child comes out of N first, then the child reserves from what is left.
+    tissue_cost = 0.03 * FLESH
+    child_rho = world_init.diet_from_genome(cre.genome.g[1:2], cfg)[0]
+    expected_child_n = jnp.minimum(0.3 * child_rho, parent_n - tissue_cost)
+    assert jnp.allclose(cre.body.N[1], expected_child_n, atol=1e-6)
+    remaining = parent_n - tissue_cost - expected_child_n
+    parent_rho = jnp.asarray([0.2, 0.5, 0.3])  # parent genome diet genes
+    loss = jnp.minimum(0.02 * parent_rho, remaining)
+    expected_parent_n = parent_n - tissue_cost - expected_child_n - loss
+    assert jnp.allclose(cre.body.N[0], expected_parent_n, atol=1e-6)
+    # The adult's tissue is not consumed by reproduction.
+    assert jnp.array_equal(cre.body.B[0], parent_b)
+
+
+def test_birth_fails_without_tissue_in_control_arm():
+    """Control arm (tissue_from_reserves=false) keeps the old no_tissue failure."""
+    cfg = small_cfg().replaced(
+        reproduction=ReproductionConfig(tissue_from_reserves=False)
     )
-    assert jnp.allclose(cre.body.N[0], expected_parent_n, atol=1e-2)
-    assert jnp.allclose(cre.body.B[0], jnp.asarray([0.15, 0.35, 0.0]) - 0.03 * FLESH, atol=1e-6)
-
-
-def test_birth_fails_without_tissue():
-    """B_child cannot be paid -> birth_fail with reason no_tissue (§5.5)."""
-    cfg = small_cfg()
     state = body_state(
         cfg, rho=(0.2, 0.5, 0.3), reserves=(0.5, 0.5, 0.5), tissue=(0.001, 0.001, 0.0)
     )
@@ -517,6 +531,23 @@ def test_birth_fails_without_tissue():
     assert int(buffer.kind[0]) == events.kind_code("birth_fail")
     assert int(buffer.reason[0]) == events.reason_code("no_tissue")
     assert not bool(out.entities.creature.alive[1])
+
+
+def test_birth_fails_without_reserve():
+    """Default arm: one N component below B_child fails with no_reserve (§5.5)."""
+    cfg = small_cfg()
+    reserves = (0.001, 0.5, 0.5)  # first component < 0.03*0.3 = 0.009
+    tissue = (0.15, 0.35, 0.0)  # enough tissue in the control arm, irrelevant here
+    state = body_state(cfg, rho=(0.2, 0.5, 0.3), reserves=reserves, tissue=tissue)
+    out, buffer = reproduction.apply(state, cfg)
+    assert int(buffer.count) == 1
+    assert int(buffer.kind[0]) == events.kind_code("birth_fail")
+    assert int(buffer.reason[0]) == events.reason_code("no_reserve")
+    cre = out.entities.creature
+    assert not bool(cre.alive[1])
+    # A failed birth consumes no payment.
+    assert jnp.allclose(cre.body.N[0], jnp.asarray(reserves), atol=1e-7)
+    assert jnp.allclose(cre.body.B[0], jnp.asarray(tissue), atol=1e-7)
 
 
 def test_base_metabolism_reads_body_config():

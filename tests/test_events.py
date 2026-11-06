@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from life_sandbox.config import Config, WorldConfig
+from life_sandbox.config import Capacities, Config, RunConfig, WorldConfig
 from life_sandbox.core import components as C
 from life_sandbox.core import events
 from life_sandbox.core.hashing import state_hash
@@ -31,6 +31,39 @@ def test_nutrient_field_defaults_to_none_and_accepts_a_type():
     assert int(buffer.nutrient[0]) == -1
     buffer = events.append(buffer, kind=events.kind_code("death"), uid=1, nutrient=C.PLANT)
     assert int(buffer.nutrient[0]) == C.PLANT
+
+
+def test_parent_uid_defaults_and_birth_events():
+    """Birth events carry parent_uid; every other kind keeps NO_REF (§5.5)."""
+    cfg = _small_cfg()
+    buffer = events.empty(cfg)
+    assert int(buffer.parent_uid[0]) == C.NO_REF
+    buffer = events.append(
+        buffer, kind=events.kind_code("birth"), tick=1, uid=5, parent_uid=9
+    )
+    assert int(buffer.parent_uid[0]) == 9
+    buffer = events.append(buffer, kind=events.kind_code("death"), tick=1, uid=6)
+    assert int(buffer.parent_uid[1]) == C.NO_REF
+    assert events.reason_code("no_reserve") >= 0
+
+
+def test_segment_event_overflow_is_observable():
+    """Segment-level overflow is visible via dropped_events and events['dropped']."""
+    from life_sandbox.core.step import run
+    from life_sandbox.world.init import initial_state
+
+    cfg = Config.default().replaced(
+        world=WorldConfig(event_capacity=2, founders=2),
+        capacities=Capacities(creature=8, bush=6, carcass=2, neutral=1),
+        run=RunConfig(seed=3, ticks=1),
+    )
+    state = initial_state(cfg)
+    # founders=2 < 8 -> the first tick reseeds and emits 4 reseed + 4 birth
+    # events, far more than the capacity of 2.
+    result = run(state, cfg, 1, compile=False, collect_events=True)
+    assert result.dropped_events > 0
+    assert int(result.events["dropped"]) == result.dropped_events
+    assert result.event_count() == 2 * 1  # capacity per tick
 
 
 def test_overflow_increments_dropped_without_growing():
@@ -63,7 +96,7 @@ def test_scan_path_carries_events_not_only_counts(tiny_cfg):
     assert eager.counts == compiled.counts
     assert eager.event_count() == compiled.event_count()
     assert eager.event_count() == sum(eager.counts.values())
-    for name in ("kind", "uid", "x", "y"):
+    for name in ("kind", "uid", "parent_uid", "x", "y"):
         assert eager.events[name].shape == compiled.events[name].shape
         assert np.array_equal(eager.events[name], compiled.events[name])
     assert eager.inflow.shape == (C.N_INFLOW_CATEGORIES, C.N_NUTRIENTS)

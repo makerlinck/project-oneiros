@@ -81,6 +81,7 @@ _EVENT_FIELDS = (
     "kind",
     "tick",
     "uid",
+    "parent_uid",
     "target_kind",
     "target_uid",
     "same_lineage",
@@ -126,7 +127,7 @@ def append_events_batch(buffer: events.EventBuffer, valid: jax.Array, **values) 
             # the neutral value (death-only nutrient, no target, success).
             if name == "nutrient":
                 fill = -1
-            elif name == "target_kind":
+            elif name in ("target_kind", "parent_uid"):
                 fill = C.NO_REF
             elif name == "success":
                 fill = True
