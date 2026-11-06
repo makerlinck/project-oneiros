@@ -49,6 +49,7 @@ def _wrap(angle):
 KNOB_MODE = "constant"
 AVOID_TOXIN = False
 MIN_STOCK = 0.0
+AVOID_HOT = 0.0  # |temperature| threshold for bush zones; 0 disables
 
 
 def forager_think(state, cfg):
@@ -70,6 +71,13 @@ def forager_think(state, cfg):
         species = bush.edible.kind
         toxin_share = state.comp[:, C.TOXIN][species]
         distance = jnp.where(toxin_share[None, :] > 0.05, jnp.inf, distance)
+    if AVOID_HOT > 0.0:
+        # Avoid the lethal temperature zones when choosing a bush: scaled
+        # geographic temperature at the bush centre (day phase is global).
+        scaled = cfg.world.temperature_scale * (-2.0 + 4.0 * bush.transform.pos[:, 1] / cfg.world.height)
+        safe = jnp.abs(scaled) <= AVOID_HOT
+        safe_distance = jnp.where(safe[None, :], distance, jnp.inf)
+        distance = jnp.where(jnp.any(safe[None, :], axis=1, keepdims=True), safe_distance, distance)
     if MIN_STOCK > 0.0:
         # A competent forager does not sit on an emptied bush: prefer any bush
         # that still has berries, fall back to the nearest bush otherwise.
@@ -339,14 +347,16 @@ def main() -> None:
     parser.add_argument("--knob-mode", choices=("constant", "adaptive"), default="constant")
     parser.add_argument("--avoid-toxin", action="store_true")
     parser.add_argument("--min-stock", type=float, default=0.0)
+    parser.add_argument("--avoid-hot", type=float, default=0.0)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
-    global KNOB, KNOB_MODE, AVOID_TOXIN, MIN_STOCK
+    global KNOB, KNOB_MODE, AVOID_TOXIN, MIN_STOCK, AVOID_HOT
     KNOB = float(args.knob)
     KNOB_MODE = args.knob_mode
     AVOID_TOXIN = bool(args.avoid_toxin)
     MIN_STOCK = float(args.min_stock)
+    AVOID_HOT = float(args.avoid_hot)
     cfg = design_config(args)
     seeds = [9300 + i for i in range(args.worlds)]
     step_fn = forager_step if args.arm == "forager" else engine_step
