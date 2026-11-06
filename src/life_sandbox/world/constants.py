@@ -36,9 +36,6 @@ BUSH_T_SIGMA: float = 0.5
 FOUNDER_TOXIN_LOGIT_MEAN: float = -3.0
 FOUNDER_LOGIT_STD: float = 1.0
 
-# Genome init scale for founders (§6.3).
-GENOME_INIT_STD: float = 0.1
-
 # Bush appearance (§4.2): green mixed with the berry colour by stock.
 BUSH_RADIUS: float = 1.0
 BUSH_GREEN: tuple[float, float, float] = (0.2, 0.6, 0.2)
@@ -56,7 +53,6 @@ BERRY_RGB: tuple[tuple[float, float, float], ...] = (
 #   adult:   mass 1.0, B = (0.03 + 0.1*(1.0 - 0.3))*c_flesh = 0.10*c_flesh
 FOUNDER_RADIUS: float = 0.5
 FOUNDER_INTEGRITY: float = 1.0
-FOUNDER_RESERVE_FRACTION: float = 0.5   # M1 scans 0.3–0.5
 CHILD_MASS: float = 0.3
 CHILD_TISSUE_FRACTION: float = 0.03
 GROWTH_TISSUE_PER_MASS: float = 0.1

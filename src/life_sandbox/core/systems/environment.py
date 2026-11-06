@@ -4,10 +4,12 @@ Owner: world teammate.  Contract: apply(state, cfg) -> (WorldState, EventBuffer)
 
 What one tick does, in this fixed order:
 
-1. Berry regeneration (§4.2): stock += (0.03*stock*(1 - stock) + 1e-4) *
-   ramp.berry_multiplier(tick, cfg), clipped to [0, 1] because stock is a
-   fraction with that range.  The startup ramp (§9) starts at three times the
-   regeneration and reaches the target at world.ramp_ticks.
+1. Berry regeneration (§4.2): stock += (world.bush_regen_rate*stock*(1 - stock)
+   + world.bush_regen_base) * ramp.berry_multiplier(tick, cfg), clipped to [0, 1]
+   because stock is a fraction with that range.  The coefficients are M1
+   calibration parameters read from the configuration, not module constants.
+   The startup ramp (§9) starts at three times the regeneration and reaches the
+   target at world.ramp_ticks.
 2. Carcass rot (§4.2): 0.5% of plant and animal matter becomes toxin every tick.
    The conversion is an internal transfer in the nutrient book (§3.5), so it is
    recorded as ledger.transfer_from = [rotP, rotA, 0] and
@@ -50,10 +52,6 @@ from life_sandbox.core.state import WorldState
 from life_sandbox.core.struct import update
 from life_sandbox.world.constants import BERRY_RGB, BUSH_GREEN, INITIAL_COMP
 
-# Berry regeneration coefficients (§4.2).
-BERRY_GROWTH: float = 0.03
-BERRY_SEED: float = 1e-4
-
 # Carcass decay (§4.2): 0.5% of plant and animal matter rots into toxin per tick.
 CARCASS_ROT: float = 0.005
 CARCASS_MAX_AGE: int = 600
@@ -72,14 +70,15 @@ _EMPTY_EPS = 1e-9
 def berry_growth(arena: BushArena, tick, cfg: Config) -> BushArena:
     """One regeneration step for the bush stock field (§4.2, §9).
 
-    The logistic increment (not the standing stock) is scaled by the startup
-    ramp multiplier before clipping, so the ramp makes berries regrow faster
-    without changing the [0, 1] range.
+    The logistic increment (not the standing stock) uses the M1 calibration
+    coefficients world.bush_regen_rate / world.bush_regen_base and is scaled by
+    the startup ramp multiplier before clipping, so the ramp makes berries
+    regrow faster without changing the [0, 1] range.
     """
     stock = arena.edible.stock
-    increment = (BERRY_GROWTH * stock * (1.0 - stock) + BERRY_SEED) * ramp.berry_multiplier(
-        tick, cfg
-    )
+    increment = (
+        cfg.world.bush_regen_rate * stock * (1.0 - stock) + cfg.world.bush_regen_base
+    ) * ramp.berry_multiplier(tick, cfg)
     grown = jnp.clip(stock + increment, 0.0, 1.0)
     stock = jnp.where(arena.alive, grown, stock)
     return update(arena, edible=update(arena.edible, stock=stock))

@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import pytest
 
 from life_sandbox.brain.genome import layout as brain_layout
-from life_sandbox.config import Capacities, Config, MotionConfig, WorldConfig
+from life_sandbox.config import BodyConfig, Capacities, Config, MotionConfig, WorldConfig
 from life_sandbox.core import components as C, events
 from life_sandbox.core.state import empty
 from life_sandbox.core.struct import update
@@ -130,7 +130,7 @@ def test_first_order_digestion_and_absorption():
     eps, cap = conversions(rho)
     delta = 0.05 * jnp.asarray(stomach)
     absorbed = eps * delta
-    required = cap * (0.002)  # awake, k=0, no repair (sum N < 0.5)
+    required = cap * cfg.body.base_metabolism  # awake, k=0, no repair
     expected_n = jnp.asarray(reserves) + absorbed - required
     body = out.entities.creature.body
     assert jnp.allclose(body.G[0], 0.95 * jnp.asarray(stomach), atol=1e-7)
@@ -140,7 +140,7 @@ def test_first_order_digestion_and_absorption():
 
     # §3.5 ledger classification for this tick.
     ledger = out.ledger
-    required = cap * 0.002  # awake, k = 0, I = 1 -> no repair
+    required = cap * cfg.body.base_metabolism  # awake, k = 0, I = 1 -> no repair
     unabsorbed = (1.0 - eps) * delta
     assert jnp.allclose(ledger.digested, delta, atol=1e-7)
     assert jnp.allclose(ledger.outflow[C.OUTFLOW_METABOLISM], required, atol=1e-7)
@@ -162,8 +162,9 @@ def test_conversion_rates_follow_diet_genes():
     second = body_state(cfg, rho=(0.1, 0.8, 0.1), stomach=stomach, reserves=(0.0, 0.0, 0.0))
     out_a, _ = metabolism.apply(first, cfg)
     out_b, _ = metabolism.apply(second, cfg)
-    absorbed_a = out_a.entities.creature.body.N[0] + 0.002 * jnp.asarray([0.8, 0.1, 0.1])
-    absorbed_b = out_b.entities.creature.body.N[0] + 0.002 * jnp.asarray([0.1, 0.8, 0.1])
+    demand = cfg.body.base_metabolism
+    absorbed_a = out_a.entities.creature.body.N[0] + demand * jnp.asarray([0.8, 0.1, 0.1])
+    absorbed_b = out_b.entities.creature.body.N[0] + demand * jnp.asarray([0.1, 0.8, 0.1])
     assert absorbed_a[0] > absorbed_b[0]
     assert absorbed_a[1] < absorbed_b[1]
 
@@ -181,7 +182,7 @@ def test_absorption_overflow_clamps_at_capacity():
     delta = 0.05 * jnp.asarray([0.3, 0.3, 0.3])
     reserves_after = jnp.asarray(reserves) + eps * delta
     assert bool(jnp.all(reserves_after > rho_arr))  # overflow really happened
-    demand = 0.002  # base only: I = 1 means no repair this tick
+    demand = cfg.body.base_metabolism  # base only: I = 1 -> no repair
     expected = rho_arr - rho_arr * demand
     assert jnp.allclose(body.N[0], expected, atol=1e-6)
     # Overflow above N_cap,j is booked in its own outflow category (§3.5).
@@ -220,8 +221,10 @@ def test_deficiency_damage_and_cause():
     state = body_state(cfg, rho=rho, reserves=(0.0, 0.0, 0.0), integrity=1.0)
     out, _ = metabolism.apply(state, cfg)
     body = out.entities.creature.body
-    required = jnp.asarray(rho) * 0.002  # no repair: sum N = 0
-    assert float(body.I[0]) == pytest.approx(1.0 - 5.0 * 0.002, abs=1e-6)
+    required = jnp.asarray(rho) * cfg.body.base_metabolism  # no repair: sum N = 0
+    assert float(body.I[0]) == pytest.approx(
+        1.0 - 5.0 * cfg.body.base_metabolism, abs=1e-6
+    )
     damage = out.entities.creature.damage
     assert int(damage.cause[0]) == events.cause_code("nutrition")
     assert int(damage.nutrient[0]) == int(jnp.argmax(required))
@@ -237,7 +240,7 @@ def test_repair_restores_integrity_and_costs_reserves():
     state = body_state(cfg, rho=rho, reserves=reserves, integrity=0.5)
     out, _ = metabolism.apply(state, cfg)
     body = out.entities.creature.body
-    demand = 0.002 + 0.002  # base + repair
+    demand = cfg.body.base_metabolism + metabolism.REPAIR_RATE  # base + repair
     assert float(body.I[0]) == pytest.approx(0.502, abs=1e-6)
     assert jnp.allclose(
         body.N[0], jnp.asarray(reserves) - jnp.asarray(rho) * demand, atol=1e-6
@@ -255,7 +258,7 @@ def test_repair_only_when_integrity_below_one():
     state = body_state(cfg, rho=rho, reserves=reserves, integrity=1.0)
     out, _ = metabolism.apply(state, cfg)
     body = out.entities.creature.body
-    demand = metabolism.BASE_METABOLISM  # base only
+    demand = cfg.body.base_metabolism  # base only
     assert float(body.I[0]) == pytest.approx(1.0, abs=1e-7)
     assert jnp.allclose(body.N[0], jnp.asarray(reserves) - jnp.asarray(rho) * demand, atol=1e-6)
     assert jnp.allclose(
@@ -272,7 +275,7 @@ def test_repair_amount_capped_by_missing_integrity():
     out, _ = metabolism.apply(state, cfg)
     body = out.entities.creature.body
     repaired = 1.0 - 0.999
-    demand = metabolism.BASE_METABOLISM + repaired
+    demand = cfg.body.base_metabolism + repaired
     assert float(body.I[0]) == pytest.approx(1.0, abs=1e-7)
     assert jnp.allclose(body.N[0], jnp.asarray(reserves) - jnp.asarray(rho) * demand, atol=1e-6)
     assert jnp.allclose(
@@ -311,19 +314,21 @@ def test_motion_cost_uses_effective_controls():
     # Intended outputs alone cost nothing; the effective controls do.
     assert jnp.allclose(
         drop_high_intent,
-        jnp.asarray(rho) * metabolism.BASE_METABOLISM,
+        jnp.asarray(rho) * cfg.body.base_metabolism,
         atol=1e-7,
     )
-    movement = 0.002 * 1.0 * 1.0 + 0.0005 * 1.0  # |u_acc'|*(1+k)*m, |u_turn'|
+    movement = (
+        cfg.body.base_metabolism * 1.0 * 1.0 + 0.0005 * 1.0
+    )  # |u_acc'|*(1+k)*m, |u_turn'|
     assert jnp.allclose(
         drop_high_eff,
-        jnp.asarray(rho) * (metabolism.BASE_METABOLISM + movement),
+        jnp.asarray(rho) * (cfg.body.base_metabolism + movement),
         atol=1e-6,
     )
 
 
 def test_base_demand_knob_and_aging_terms():
-    """Base demand = 0.002*(1+3k^2)*(1+ageing bonus), ageing after a_sen (§5.3)."""
+    """Base demand = cfg.body.base_metabolism*(1+3k^2)*(1+ageing), after a_sen."""
     cfg = small_cfg()
     rho = (0.2, 0.5, 0.3)
     reserves = (0.1, 0.1, 0.1)
@@ -334,7 +339,7 @@ def test_base_demand_knob_and_aging_terms():
     out_old, _ = metabolism.apply(old, cfg)
     drop_young = jnp.asarray(reserves) - out_young.entities.creature.body.N[0]
     drop_old = jnp.asarray(reserves) - out_old.entities.creature.body.N[0]
-    young_base = metabolism.BASE_METABOLISM * (1.0 + metabolism.KNOB_ENERGY_COEFF)
+    young_base = cfg.body.base_metabolism * (1.0 + metabolism.KNOB_ENERGY_COEFF)
     assert jnp.allclose(drop_young, jnp.asarray(rho) * young_base, atol=1e-6)
     # age 799 -> 800 in this tick, so the bonus is (800-400)/400 = 1.
     assert jnp.allclose(drop_old, jnp.asarray(rho) * young_base * 2.0, atol=1e-6)
@@ -387,7 +392,7 @@ def test_growth_payment():
     body = out.entities.creature.body
     shape = out.entities.creature.shape
     delta_mass = 0.7 / 100.0
-    demand = 0.002  # base only: I = 1 means no repair this tick
+    demand = cfg.body.base_metabolism  # base only: I = 1 -> no repair
     cost = 0.1 * delta_mass * FLESH
     capped = jnp.minimum(jnp.asarray(reserves), jnp.asarray(rho))
     expected_n = capped - jnp.asarray(rho) * demand - cost
@@ -423,8 +428,12 @@ def test_aging_metabolic_bonus():
     old_out, _ = metabolism.apply(old, cfg)
     young_drop = jnp.asarray(reserves) - young_out.entities.creature.body.N[0]
     old_drop = jnp.asarray(reserves) - old_out.entities.creature.body.N[0]
-    assert jnp.allclose(young_drop, jnp.asarray(rho) * 0.002, atol=1e-6)
-    assert jnp.allclose(old_drop, jnp.asarray(rho) * 0.002 * 2.0, atol=1e-6)
+    assert jnp.allclose(
+        young_drop, jnp.asarray(rho) * cfg.body.base_metabolism, atol=1e-6
+    )
+    assert jnp.allclose(
+        old_drop, jnp.asarray(rho) * cfg.body.base_metabolism * 2.0, atol=1e-6
+    )
     assert int(old_out.entities.creature.body.age[0]) == 800
 
 
@@ -490,17 +499,42 @@ def test_birth_fails_without_tissue():
     assert not bool(out.entities.creature.alive[1])
 
 
+def test_base_metabolism_reads_body_config():
+    """The base-demand coefficient is cfg.body.base_metabolism (M1 scan)."""
+    from life_sandbox.config import BodyConfig
+
+    cfg = small_cfg().replaced(body=BodyConfig(base_metabolism=0.01))
+    rho = (0.2, 0.5, 0.3)
+    reserves = (0.1, 0.1, 0.1)  # below the repair threshold
+    state = body_state(cfg, rho=rho, reserves=reserves)  # I = 1, no motion
+    out, _ = metabolism.apply(state, cfg)
+    drop = jnp.asarray(reserves) - out.entities.creature.body.N[0]
+    assert jnp.allclose(drop, jnp.asarray(rho) * cfg.body.base_metabolism, atol=1e-6)
+    assert cfg.body.base_metabolism == 0.01  # the default is 0.002
+
+    # The same coefficient scales the |u_acc'| work term (§5.3).
+    moving = body_state(
+        cfg, rho=rho, reserves=(0.05, 0.05, 0.05), u_eff=(1.0, 0.0)
+    )
+    out_moving, _ = metabolism.apply(moving, cfg)
+    movement = cfg.body.base_metabolism * 1.0 * (1.0 + 0.0) * (1.0 + 0.0)
+    drop_moving = jnp.asarray([0.05, 0.05, 0.05]) - out_moving.entities.creature.body.N[0]
+    assert jnp.allclose(
+        drop_moving, jnp.asarray(rho) * (cfg.body.base_metabolism + movement), atol=1e-6
+    )
+
+
 def test_metabolism_ramp_scales_only_base_demand():
     """§9 ramp: base upkeep = 0.5x at tick 0, 1x at ramp_ticks; work is unscaled."""
     cfg = ramp_cfg()
     rho = (0.2, 0.5, 0.3)
     reserves = (0.1, 0.1, 0.1)  # below the repair threshold
-    movement = 0.002 * 1.0 * 1.0 * 1.0  # |u_acc'|=1, k=0, mass=1, m_held=0
+    movement = cfg.body.base_metabolism  # |u_acc'|=1, k=0, mass=1, m_held=0
     for tick, multiplier in ((0, 0.5), (5, 0.75), (10, 1.0), (50, 1.0)):
         state = body_state(cfg, rho=rho, reserves=reserves, u_eff=(1.0, 0.0))
         state = update(state, tick=jnp.asarray(tick, jnp.int32))
         out, _ = metabolism.apply(state, cfg)
-        demand = metabolism.BASE_METABOLISM * multiplier + movement
+        demand = cfg.body.base_metabolism * multiplier + movement
         drop = jnp.asarray(reserves) - out.entities.creature.body.N[0]
         assert jnp.allclose(drop, jnp.asarray(rho) * demand, atol=1e-6), tick
         assert jnp.allclose(
@@ -516,7 +550,7 @@ def test_metabolism_ramp_does_not_scale_repair():
     state = body_state(cfg, rho=rho, reserves=reserves, integrity=0.5)
     state = update(state, tick=jnp.asarray(0, jnp.int32))
     out, _ = metabolism.apply(state, cfg)
-    demand = metabolism.BASE_METABOLISM * 0.5 + metabolism.REPAIR_RATE
+    demand = cfg.body.base_metabolism * 0.5 + metabolism.REPAIR_RATE
     drop = jnp.asarray(reserves) - out.entities.creature.body.N[0]
     assert jnp.allclose(drop, jnp.asarray(rho) * demand, atol=1e-6)
     assert float(out.entities.creature.body.I[0]) == pytest.approx(0.502, abs=1e-6)

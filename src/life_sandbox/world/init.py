@@ -14,7 +14,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from life_sandbox.brain.genome import layout as brain_layout
+from life_sandbox.brain.genome import initial_sigmas, layout as brain_layout
 from life_sandbox.config import Config
 from life_sandbox.core import components as C
 from life_sandbox.core import genome as G
@@ -48,8 +48,12 @@ def random_genome(key: jax.Array, n: int, cfg: Config) -> jax.Array:
     """
     keys = jax.random.split(key, 7)
     channels = cfg.sensors.odor_channels
-    genome_dim = brain_layout(cfg).total
-    genome = jax.random.normal(keys[0], (n, genome_dim), dtype=jnp.float32) * K.GENOME_INIT_STD
+    layout = brain_layout(cfg)
+    # C4 initialization table: per-block standard deviations follow the fan-in
+    # (SANDBOX.md §6.3), so founders differ in their default action tendencies.
+    genome = jax.random.normal(keys[0], (n, layout.total), dtype=jnp.float32) * initial_sigmas(cfg)[
+        None, :
+    ]
     diet_logits = jnp.stack(
         [
             jax.random.normal(keys[1], (n,), dtype=jnp.float32) * K.FOUNDER_LOGIT_STD,
@@ -87,7 +91,7 @@ def body_from_genome(genome: jax.Array, cfg: Config) -> C.Body:
     """Adult body defaults from a genome (founders and reseeded individuals)."""
     n = genome.shape[0]
     diet = diet_from_genome(genome, cfg)
-    reserves = K.FOUNDER_RESERVE_FRACTION * diet
+    reserves = cfg.body.founder_reserves * diet
     # Adult tissue follows from the growth rule: newborn 0.03 + 0.1 per grown
     # mass unit over (1.0 - 0.3) => 0.10 * c_flesh (SANDBOX.md §5.2, §5.5).
     tissue = K.ADULT_TISSUE_FRACTION * jnp.asarray(K.FLESH_COMP, dtype=jnp.float32)[None, :]

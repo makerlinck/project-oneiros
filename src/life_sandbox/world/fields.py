@@ -24,11 +24,13 @@ Grid convention: cell (row, col) covers world x in [col*cell, (col+1)*cell) and
 y in [row*cell, (row+1)*cell).  A world point maps to grid coordinates
 (x/cell - 0.5, y/cell - 0.5) so that cell centres sit on integers.
 
-Startup ramp (SANDBOX.md §9): the *whole* analytic temperature amplitude
+Temperature amplitude (SANDBOX.md §4.3, §9): the *whole* analytic temperature
 (geographic gradient, day phase and the in-bush -0.5 offset) is multiplied by
-core.ramp.temperature_multiplier(tick, cfg), so the world starts with a small
-temperature difference and reaches the target amplitude at world.ramp_ticks.
-Light is not ramped (the ramp section only scales the temperature difference).
+world.temperature_scale (an M1 calibration factor) and by
+core.ramp.temperature_multiplier(tick, cfg) (the startup ramp), so the world
+starts with a small temperature difference and reaches world.temperature_scale
+of the nominal amplitude at world.ramp_ticks.  Light is not scaled by either
+factor (the ramp only scales the temperature difference).
 """
 
 from __future__ import annotations
@@ -54,14 +56,19 @@ def temperature(cfg: Config, y, tick, in_bush=False):
 
     T_geo(y) = -2 + 4*y/height; the day term is +0.5*cos(2*pi*t/T_day); a body
     inside a bush is 0.5 colder (§4.2).  The whole amplitude is scaled by the
-    startup ramp multiplier (§9); with ramp_ticks = 0 the multiplier is 1.
+    M1 calibration factor world.temperature_scale and by the startup ramp
+    multiplier (§9); with ramp_ticks = 0 and temperature_scale = 1 the result is
+    the nominal amplitude.
     """
     phase = jnp.cos(2.0 * jnp.pi * jnp.asarray(tick, jnp.float32) / cfg.world.day_ticks)
     bush = jnp.asarray(in_bush, jnp.float32)
     amplitude = (
         (-2.0 + 4.0 * jnp.asarray(y, jnp.float32) / cfg.world.height) + 0.5 * phase - 0.5 * bush
     )
-    return ramp.temperature_multiplier(tick, cfg) * amplitude
+    scale = ramp.temperature_multiplier(tick, cfg) * jnp.asarray(
+        cfg.world.temperature_scale, jnp.float32
+    )
+    return scale * amplitude
 
 
 def light(cfg: Config, tick, in_bush=False):

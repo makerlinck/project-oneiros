@@ -42,6 +42,10 @@ Documented decisions (SANDBOX.md is silent):
   batched to at most B_MAX x genome_dim per tick instead of
   capacity x genome_dim.  The batch has a fixed B_MAX shape for jit tracing:
   rows with no birth are drawn with a placeholder uid and never written.
+- Control arm cfg.reproduction.randomize_genome (§9 M1): a child's genome is a
+  fresh random genome from world/init.random_genome (founder convention),
+  keyed by fold_in(reproduce_key, child_uid) alone; the parent's genome and the
+  mutation noise are ignored.  The default arm keeps parent + mutation.
 """
 
 from __future__ import annotations
@@ -200,11 +204,11 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     child_slots = free_slots[jnp.clip(success_rank, 0, capacity - 1)]
     num_success = jnp.sum(success).astype(jnp.int32)
 
-    # Child genome mutation (§6.3, C5): one noise draw per actual birth, keyed
-    # by (reproduce_key, child_uid).  Genome width is the brain layout's
-    # derived total, not a configured number.
+    # Child genome (§6.3, C5): keyed by (reproduce_key, child_uid).  Default
+    # arm: parent genome + sigma_block * N(0,1).  M1 control arm
+    # (cfg.reproduction.randomize_genome): a fresh random genome in the founder
+    # convention of world/init.random_genome, independent of the parent.
     lay = brain_genome.layout(cfg)
-    sigma = brain_genome.mutation_sigmas(cfg)
     child_uid = state.uid_counter + success_rank
     rank_index = jnp.where(success, success_rank, jnp.asarray(B_MAX, jnp.int32))
     uid_by_rank = jnp.zeros((B_MAX,), jnp.int32).at[rank_index].set(
@@ -216,13 +220,25 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     parent_by_rank = jnp.zeros((B_MAX,), jnp.int32).at[rank_index].set(
         jnp.where(success, slots, 0)
     )
-    child_keys = jax.vmap(lambda uid: jax.random.fold_in(reproduce_key, uid))(uid_by_rank)
-    noise = jax.vmap(
-        lambda child_key: jax.random.normal(child_key, (lay.total,), dtype=jnp.float32)
-    )(child_keys)
-    child_genome_by_rank = (
-        creature.genome.g[parent_by_rank] + noise * sigma[None, :]
-    )
+    if cfg.reproduction.randomize_genome:
+        def _fresh_genome(uid):
+            child_key = jax.random.fold_in(reproduce_key, uid)
+            return world_init.random_genome(child_key, 1, cfg)[0]
+
+        child_genome_by_rank = jax.vmap(_fresh_genome)(uid_by_rank)
+    else:
+        sigma = brain_genome.mutation_sigmas(cfg)
+        child_keys = jax.vmap(lambda uid: jax.random.fold_in(reproduce_key, uid))(
+            uid_by_rank
+        )
+        noise = jax.vmap(
+            lambda child_key: jax.random.normal(
+                child_key, (lay.total,), dtype=jnp.float32
+            )
+        )(child_keys)
+        child_genome_by_rank = (
+            creature.genome.g[parent_by_rank] + noise * sigma[None, :]
+        )
     child_heading = jax.random.uniform(
         key_theta, (capacity,), dtype=jnp.float32, minval=-jnp.pi, maxval=jnp.pi
     )

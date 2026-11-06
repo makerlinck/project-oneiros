@@ -238,11 +238,41 @@ def test_bush_bite_ledger_and_berry_book():
     assert nutrient_books.closed, nutrient_books
     assert nutrient_books.inflow[C.INFLOW_BITES].sum() > 0.0
 
-    regen = accounting.berry_regeneration(start)
-    berry = accounting.berry_books(start, end, result, regeneration=regen)
+    regen = accounting.berry_regeneration(start, cfg)
+    berry = accounting.berry_books(start, end, result, cfg)  # default regen from cfg
     assert berry.closed, berry
     assert float(berry.outflow[0]) == pytest.approx(0.05, abs=1e-6)
     assert float(berry.inflow[0]) == pytest.approx(float(regen), abs=1e-7)
+
+
+def test_berry_regeneration_reads_config_and_mirrors_environment():
+    """The berry mirror uses cfg.world.bush_regen_* and the startup ramp (§4.2, §9)."""
+    cfg = small_cfg()
+    start = _bite_world(cfg)  # one bush with stock 0.4
+    env_out, _ = environment.apply(start, cfg)
+    added = accounting.berry_stock(env_out) - accounting.berry_stock(start)
+    assert accounting.berry_regeneration(start, cfg) == pytest.approx(added, abs=1e-7)
+
+    # M1 config values drive the mirror instead of module constants.
+    scaled = cfg.replaced(
+        world=WorldConfig(founders=2, bush_regen_rate=0.1, bush_regen_base=0.01)
+    )
+    expected = 0.1 * 0.4 * 0.6 + 0.01
+    assert accounting.berry_regeneration(start, scaled) == pytest.approx(expected, abs=1e-7)
+
+    # The startup ramp multiplies the increment before the [0, 1] clip.
+    ramped = cfg.replaced(
+        world=WorldConfig(
+            founders=2,
+            bush_regen_rate=0.1,
+            bush_regen_base=0.01,
+            ramp_ticks=10,
+            ramp_berry_multiplier=2.0,
+        )
+    )
+    assert accounting.berry_regeneration(start, ramped) == pytest.approx(
+        2.0 * expected, abs=1e-7
+    )
 
 
 def _dead_creature(state, slot, uid, reserves, tissue):

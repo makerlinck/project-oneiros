@@ -14,8 +14,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from life_sandbox.brain import genome as brain_genome
-from life_sandbox.config import Capacities, Config, MotionConfig
-from life_sandbox.core import components as C, events, rng
+from life_sandbox.config import Capacities, Config, MotionConfig, ReproductionConfig
+from life_sandbox.core import components as C, events, genome as core_genome, rng
 from life_sandbox.core.hashing import state_hash
 from life_sandbox.core.state import empty
 from life_sandbox.core.struct import update
@@ -26,10 +26,11 @@ START_UID = 1000
 PARENT_RESERVES = (0.17, 0.17, 0.17)  # sum 0.51: just above theta_repro = 0.5
 
 
-def make_cfg(capacity: int = 40) -> Config:
+def make_cfg(capacity: int = 40, *, randomize: bool = False) -> Config:
     return Config.default().replaced(
         capacities=Capacities(creature=capacity, bush=6, carcass=2, neutral=1),
         motion=MotionConfig(noise_scale=0.0),
+        reproduction=ReproductionConfig(randomize_genome=randomize),
     )
 
 
@@ -255,3 +256,89 @@ def test_reproduction_compiled_and_eager_agree():
     # The compiled execution mode is bit-reproducible with itself (SANDBOX §2).
     again_out, _ = jitted(state)
     assert state_hash(again_out) == state_hash(jit_out)
+
+
+def _with_modified_parent_genome(state, cfg, slot: int, value: float = 3.0):
+    """Change the parent's weight block only (eligibility header untouched)."""
+    lay = brain_genome.layout(cfg)
+    cre = state.entities.creature
+    genome = cre.genome.g.at[slot, lay.w_in].set(value)
+    return update(
+        state, entities=update(state.entities, creature=update(cre, genome=C.Genome(g=genome)))
+    )
+
+
+def test_randomize_genome_arm_is_parent_independent():
+    """cfg.reproduction.randomize_genome: child genome ignores the parent (§9 M1)."""
+    cfg = make_cfg(8, randomize=True)
+    base = add_parent(base_state(cfg), cfg, 0, pos=(10.0, 10.0), uid=1)
+    out_a, buffer_a = reproduction.apply(base, cfg)
+    assert len(of_kind(buffer_a, "birth")) == 1
+    child_a = out_a.entities.creature.genome.g[1]
+
+    modified = _with_modified_parent_genome(base, cfg, 0)
+    out_b, buffer_b = reproduction.apply(modified, cfg)
+    assert len(of_kind(buffer_b, "birth")) == 1
+    child_b = out_b.entities.creature.genome.g[1]
+    assert jnp.array_equal(child_a, child_b)  # parent genome is ignored
+    assert not jnp.array_equal(child_a, base.entities.creature.genome.g[0])
+    # Founder convention from world/init.random_genome: theta_repro ~ U[0.5, 1].
+    theta_index = core_genome.theta_repro_index(cfg.sensors.odor_channels)
+    assert 0.5 <= float(child_a[theta_index]) <= 1.0
+    assert float(jnp.max(jnp.abs(child_a))) > 0.0
+
+
+def test_randomize_genome_is_keyed_by_child_uid():
+    """Fresh random genomes are reproducible per child_uid and distinct per child."""
+    cfg = make_cfg(8, randomize=True)
+    base = add_parent(base_state(cfg), cfg, 0, pos=(10.0, 10.0), uid=1)
+    first, _ = reproduction.apply(base, cfg)
+    again, _ = reproduction.apply(base, cfg)
+    assert jnp.array_equal(
+        first.entities.creature.genome.g[1], again.entities.creature.genome.g[1]
+    )
+
+    crowded = many_parents(cfg, 2)
+    crowded_out, buffer = reproduction.apply(crowded, cfg)
+    births = of_kind(buffer, "birth")
+    assert len(births) == 2
+    rows = []
+    for row in births:
+        slot = int(
+            jnp.where(crowded_out.entities.creature.identity.uid == row["uid"])[0][0]
+        )
+        rows.append(crowded_out.entities.creature.genome.g[slot])
+    assert not jnp.array_equal(rows[0], rows[1])
+
+
+def test_default_arm_still_uses_parent_plus_mutation():
+    """The default arm (randomize_genome=False) keeps parent + sigma * N(0,1)."""
+    cfg = make_cfg(8)
+    assert cfg.reproduction.randomize_genome is False
+    state = add_parent(base_state(cfg), cfg, 0, pos=(10.0, 10.0), uid=1)
+    out, _ = reproduction.apply(state, cfg)
+    parent = state.entities.creature.genome.g[0]
+    child = out.entities.creature.genome.g[1]
+    key = rng.system_key(state.key, state.tick, "reproduce")
+    lay = brain_genome.layout(cfg)
+    sigma = brain_genome.mutation_sigmas(cfg)
+    expected = parent + jax.random.normal(
+        jax.random.fold_in(key, START_UID), (lay.total,), dtype=jnp.float32
+    ) * sigma
+    assert jnp.allclose(child, expected, atol=1e-7)
+
+
+def test_randomize_genome_arm_compiles_and_matches_eager():
+    """The control arm is jit-safe and reproducible on the same input state."""
+    cfg = make_cfg(8, randomize=True)
+    state = add_parent(base_state(cfg), cfg, 0, pos=(10.0, 10.0), uid=1)
+    eager_out, eager_buffer = reproduction.apply(state, cfg)
+    jitted = jax.jit(lambda s: reproduction.apply(s, cfg))
+    jit_out, jit_buffer = jitted(state)
+    assert records(eager_buffer) == records(jit_buffer)
+    assert state_hash(update(eager_out, ledger=C.Ledger.zeros())) == state_hash(
+        update(jit_out, ledger=C.Ledger.zeros())
+    )
+    assert jnp.array_equal(
+        eager_out.entities.creature.genome.g[1], jit_out.entities.creature.genome.g[1]
+    )

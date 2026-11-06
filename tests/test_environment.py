@@ -41,6 +41,11 @@ def state_of(cfg: Config):
     return empty(cfg, rng.world_key(13))
 
 
+def regen_increment(cfg: Config, stock: float) -> float:
+    """One-tick berry regeneration increment from the configuration (§4.2)."""
+    return cfg.world.bush_regen_rate * stock * (1.0 - stock) + cfg.world.bush_regen_base
+
+
 def _full(values, capacity, dtype, fill):
     """Pad or truncate a per-slot vector to the arena capacity."""
     values = jnp.asarray(values, dtype)
@@ -135,10 +140,10 @@ def test_berry_regeneration_matches_the_logistic_step():
     out, _ = environment.apply(state, cfg)
     stock = np.asarray(out.entities.bush.edible.stock)
     expected = [
-        0.3 + 0.03 * 0.3 * 0.7 + 1e-4,
-        0.5 + 0.03 * 0.5 * 0.5 + 1e-4,
+        0.3 + regen_increment(cfg, 0.3),
+        0.5 + regen_increment(cfg, 0.5),
         1.0,
-        1e-4,
+        cfg.world.bush_regen_base,
     ]
     assert stock.tolist() == pytest.approx(expected, abs=1e-7)
 
@@ -149,7 +154,7 @@ def test_dead_bushes_do_not_regenerate():
     out, _ = environment.apply(state, cfg)
     stock = np.asarray(out.entities.bush.edible.stock)
     assert stock[0] == pytest.approx(0.3, abs=1e-7)
-    assert stock[1] == pytest.approx(0.3 + 0.03 * 0.3 * 0.7 + 1e-4, abs=1e-7)
+    assert stock[1] == pytest.approx(0.3 + regen_increment(cfg, 0.3), abs=1e-7)
 
 
 def test_carcass_rot_turns_plant_and_animal_matter_into_toxin():
@@ -410,9 +415,9 @@ def test_compiled_ledger_matches_eager():
             np.asarray(getattr(compiled.ledger, name)),
         ), name
 
-def _ramp_increment(stock: float) -> float:
+def _ramp_increment(cfg: Config, stock: float) -> float:
     """Berry regeneration increment before the ramp multiplier (§4.2, §9)."""
-    return 0.03 * stock * (1.0 - stock) + 1e-4
+    return regen_increment(cfg, stock)
 
 
 def test_ramp_boosts_berry_regeneration():
@@ -434,7 +439,7 @@ def test_ramp_boosts_berry_regeneration():
     middle_stock = np.asarray(middle_out.entities.bush.edible.stock)
     late_stock = np.asarray(late_out.entities.bush.edible.stock)
     for slot, start in enumerate(stocks):
-        increment = _ramp_increment(start)
+        increment = _ramp_increment(ramped, start)
         assert plain_stock[slot] == pytest.approx(min(1.0, start + increment), abs=1e-7)
         # tick 0: multiplier 3; tick 5: 3 + (1 - 3) * 0.5 = 2; tick 10: 1.
         assert ramp_stock[slot] == pytest.approx(min(1.0, start + 3.0 * increment), abs=1e-7)
@@ -468,7 +473,13 @@ def test_ramp_blocks_the_toxin_switch_and_keeps_berries_nontoxic():
 
 
 def test_ramped_apply_traces_under_jit():
-    cfg = make_cfg(ramp_ticks=10, l_ticks=4.0, c_switch=1.0)
+    cfg = make_cfg(
+        ramp_ticks=10,
+        l_ticks=4.0,
+        c_switch=1.0,
+        bush_regen_rate=0.06,  # non-default calibration values
+        bush_regen_base=2e-4,
+    )
     state = set_stock(state_of(cfg), [0.3, 0.5], kinds=[0, 1])
     state = set_carcass(state, 0, [0.5, 0.4, 0.1], age=3)
     state = at_tick(state, 4)  # inside the ramp, on a period multiple
@@ -484,6 +495,13 @@ def test_ramped_apply_traces_under_jit():
         np.asarray(eager.entities.bush.edible.stock),
         atol=1e-6,
     )
+    # The jitted path uses the configuration coefficients and the ramp: tick 4
+    # of a 10-tick ramp has berry multiplier 3 + (1 - 3) * 0.4 = 2.2.
+    multiplier = 3.0 + (1.0 - 3.0) * 0.4
+    stock = np.asarray(out.entities.bush.edible.stock)
+    for slot, start in enumerate((0.3, 0.5)):
+        expected = min(1.0, start + multiplier * regen_increment(cfg, start))
+        assert stock[slot] == pytest.approx(expected, abs=1e-6)
     for name in ("transfer_from", "transfer_to", "outflow"):
         assert np.allclose(
             np.asarray(getattr(out.ledger, name)),
@@ -492,4 +510,34 @@ def test_ramped_apply_traces_under_jit():
         ), name
     out, buffer = compiled(out, cfg)  # still traceable on the next tick
     assert out.entities.bush.edible.stock.shape == (cfg.capacities.bush,)
+
+
+def test_berry_regeneration_reads_the_config_coefficients():
+    base_cfg = make_cfg()
+    fast_cfg = make_cfg(bush_regen_rate=2.0 * base_cfg.world.bush_regen_rate)
+    rich_cfg = make_cfg(bush_regen_base=2.0 * base_cfg.world.bush_regen_base)
+    stocks = [0.3, 0.5]
+
+    def grown(cfg):
+        out, _ = environment.apply(set_stock(state_of(cfg), stocks), cfg)
+        return np.asarray(out.entities.bush.edible.stock)
+
+    base_stock = grown(base_cfg)
+    fast_stock = grown(fast_cfg)
+    rich_stock = grown(rich_cfg)
+    rate = base_cfg.world.bush_regen_rate
+    seed = base_cfg.world.bush_regen_base
+    for slot, start in enumerate(stocks):
+        rate_term = rate * start * (1.0 - start)
+        assert base_stock[slot] == pytest.approx(start + rate_term + seed, abs=1e-7)
+        # Doubling the rate only doubles the logistic term, not the seed term.
+        assert fast_stock[slot] - start == pytest.approx(2.0 * rate_term + seed, abs=1e-7)
+        assert rich_stock[slot] - start == pytest.approx(rate_term + 2.0 * seed, abs=1e-7)
+
+
+def test_berry_regeneration_still_clips_after_the_config_scaling():
+    cfg = make_cfg(bush_regen_rate=0.5, bush_regen_base=1e-2)
+    state = set_stock(state_of(cfg), [0.99], kinds=[0])
+    out, _ = environment.apply(state, cfg)
+    assert float(out.entities.bush.edible.stock[0]) == pytest.approx(1.0, abs=1e-7)
 

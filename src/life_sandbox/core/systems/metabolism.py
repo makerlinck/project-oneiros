@@ -37,6 +37,8 @@ Documented decisions (SANDBOX.md is silent):
 - The startup ramp (§9) multiplies only the base upkeep term by
   ramp.metabolism_multiplier(tick, cfg); movement, bite and repair costs are
   physical work and are not ramped.
+- The base-demand coefficient is cfg.body.base_metabolism (M1 scan); the same
+  coefficient scales the |u_acc'| movement term (§5.3 uses one 0.002 there).
 - Growth is all-or-nothing per tick: if any component of 0.1*delta_m*c_flesh
   is unavailable, the tick adds no mass.
 - "inside a bush" for shading is the centre within the bush radius; temperature
@@ -71,9 +73,9 @@ GROWTH_PER_TICK: float = 0.7 / A_MATURE
 TISSUE_PER_MASS: float = 0.1
 REPAIR_RATE: float = 0.002
 REPAIR_MIN_RESERVES: float = 0.5
-BASE_METABOLISM: float = 0.002
-# Base-demand knob term: 0.002*(1 + 3*k^2) (§5.3).  The 3 is the knob energy
-# coefficient, not an ageing rate; the ageing bonus is derived from a_sen.
+# Base-demand coefficient: cfg.body.base_metabolism (M1 calibration knob).
+# Knob term (1 + 3*k^2) (§5.3); the 3 is the knob energy coefficient, not an
+# ageing rate; the ageing bonus is derived from a_sen.
 KNOB_ENERGY_COEFF: float = 3.0
 INJURY_DECAY: float = 0.7
 INJURY_GAIN: float = 10.0
@@ -144,8 +146,9 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     # Motion cost uses the effective controls u' the motion system applied
     # (§5.3: "0.002*|u'_acc| ..."), not the raw intended outputs.
     u_eff = creature.motor.u_eff
+    base_metabolism = cfg.body.base_metabolism
     movement = (
-        BASE_METABOLISM
+        base_metabolism
         * jnp.abs(u_eff[:, 0])
         * (1.0 + knob)
         * (mass + m_held)
@@ -155,7 +158,7 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     # Startup ramp (§9): only the base demand is scaled, never the movement,
     # bite or repair surcharges (those are physical work, not upkeep).
     base = (
-        BASE_METABOLISM
+        base_metabolism
         * (1.0 + KNOB_ENERGY_COEFF * knob * knob)
         * (1.0 + aging_bonus)
         * jnp.where(asleep, 0.5, 1.0)

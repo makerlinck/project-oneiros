@@ -64,10 +64,20 @@ to layout.plastic_dim (H*D + H*H + N_OUT*H + D*H).
 
 mutation_sigmas(cfg) returns the per-block mutation scale used by reproduction
 (SANDBOX.md 6.3): genome blocks mutate with g' = g + sigma_block * N(0, 1).
+
+initial_sigmas(cfg) returns the per-slot standard deviation world/init draws
+founder genomes with (C4 weight-init table, moved before M1): fan-in scaling
+1/sqrt(D) for W_in/W_err and 1/sqrt(H) for W_rec/W_out/W_mod/W_pred, g scaled by
+1/sqrt(M); b is 0.1 and b_out 1.0 (output units start with distinct
+preferences); the plasticity meta-parameters and Hebbian A-D stay 0.1 until C4's
+plasticity init is fixed before M2; shared header slots default to 0.1 because
+world/init overwrites diet/colour/odour/theta_repro with the founder conventions
+of SANDBOX 5.1.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -91,6 +101,15 @@ SIGMA_WEIGHT: float = 0.02
 SIGMA_LOG_RATE: float = 0.1
 SIGMA_HEADER_TRAIT: float = 0.05
 SIGMA_THETA_REPRO: float = 0.02
+
+# Initial genome scales (C4 weight-init table, moved before M1; SANDBOX 6.3).
+# Fan-in scaled: a hidden unit sums D (or H) zero-mean inputs, so weight std
+# 1/sqrt(fan_in) keeps its drive O(1) and tanh away from saturation.
+INIT_BIAS_STD: float = 0.1
+INIT_OUTPUT_BIAS_STD: float = 1.0  # output units start with distinct preferences
+INIT_LOG_RATE_STD: float = 0.1  # C4 plasticity init lands before M2
+INIT_HEBB_COEF_STD: float = 0.1  # A-D of SANDBOX 6.1; C4 before M2
+INIT_HEADER_STD: float = 0.1  # world/init fills the shared header itself
 
 # Slice dimensions appended when cfg.learning.readable_leak is on (SANDBOX 5.6).
 LEAK_DIM: int = 5
@@ -375,4 +394,45 @@ def mutation_sigmas(cfg) -> jax.Array:
     sigma = sigma.at[lay.log_eta].set(SIGMA_LOG_RATE)
     sigma = sigma.at[lay.log_lambda].set(SIGMA_LOG_RATE)
     sigma = sigma.at[lay.log_eta_p].set(SIGMA_LOG_RATE)
+    return sigma
+
+
+def initial_sigmas(cfg) -> jax.Array:
+    """Per-slot standard deviation of a founder genome (C4, SANDBOX.md 6.3).
+
+    Returns float32[layout(cfg).genome_dim].  world/init draws founder genomes
+    as sigma_slot * N(0, 1), so the scale is per genome slot and follows the
+    block layout.  Fan-in scaling (SANDBOX 6.3 weight init):
+
+        w_in, w_err            std = 1/sqrt(D)   (fan-in = slice width)
+        w_rec, w_out, w_mod,
+        w_pred                 std = 1/sqrt(H)   (fan-in = hidden width)
+        g                      std = 1/sqrt(M)   (modulator mixing)
+        b                      std = 0.1
+        b_out                  std = 1.0         (distinct output preferences)
+
+    The plasticity meta-parameters (log eta/lambda/eta_p) and the Hebbian A-D
+    coefficients stay at 0.1 until C4's plasticity initialisation is fixed
+    before M2.  The shared header (diet/colour/odour/theta_repro) defaults to
+    0.1; world/init overwrites it with the founder conventions of SANDBOX 5.1,
+    so this function does not encode them.
+    """
+    lay = layout(cfg)
+    sigma = jnp.full((int(lay.total),), INIT_HEADER_STD, dtype=jnp.float32)
+    w_in_std = jnp.float32(1.0 / math.sqrt(lay.d))
+    w_hidden_std = jnp.float32(1.0 / math.sqrt(lay.h))
+    g_std = jnp.float32(1.0 / math.sqrt(lay.m))
+    sigma = sigma.at[lay.w_in].set(w_in_std)
+    sigma = sigma.at[lay.w_err].set(w_in_std)
+    sigma = sigma.at[lay.w_rec].set(w_hidden_std)
+    sigma = sigma.at[lay.w_out].set(w_hidden_std)
+    sigma = sigma.at[lay.w_mod].set(w_hidden_std)
+    sigma = sigma.at[lay.w_pred].set(w_hidden_std)
+    sigma = sigma.at[lay.g].set(g_std)
+    sigma = sigma.at[lay.b].set(INIT_BIAS_STD)
+    sigma = sigma.at[lay.b_out].set(INIT_OUTPUT_BIAS_STD)
+    sigma = sigma.at[lay.log_eta].set(INIT_LOG_RATE_STD)
+    sigma = sigma.at[lay.log_lambda].set(INIT_LOG_RATE_STD)
+    sigma = sigma.at[lay.log_eta_p].set(INIT_LOG_RATE_STD)
+    sigma = sigma.at[lay.hebb].set(INIT_HEBB_COEF_STD)
     return sigma

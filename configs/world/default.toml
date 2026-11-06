@@ -9,6 +9,9 @@ segment_ticks = 64    # 每段 lax.scan 的 tick 数；K 只影响吞吐，不�
 width = 64.0          # §4.1 平面 64 x 64 单位
 height = 64.0
 cell = 1.0            # 场的网格：每单位一格
+bush_regen_rate = 0.03   # §4.2 浆果再生率（M1 扫描）
+bush_regen_base = 1e-4   # §4.2 再生基数（M1 扫描）
+temperature_scale = 1.0  # 温差幅度整体倍率（M1 扫描；ramp 另有乘子）
 day_ticks = 200.0     # 昼夜周期（ARCHITECTURES.md §3.1 提到 T_day 约 200 tick）
 odor_diffusion = 0.2  # §4.3 D = 0.2
 odor_decay = 0.02     # §4.3 delta = 0.02
@@ -54,6 +57,13 @@ prediction = true
 eta_granularity = "per_unit"   # per_unit | per_group | shared
 body_loop = true
 readable_leak = false
+
+[body]
+base_metabolism = 0.002   # §5.3 基础代谢（M1 扫描）
+founder_reserves = 0.5    # §5.5 创始储量比例（M1 扫描 0.3-0.5）
+
+[reproduction]
+randomize_genome = false  # §9 M1 对照臂：每次出生重新随机化基因组
 
 [motion]
 noise_scale = 1.0

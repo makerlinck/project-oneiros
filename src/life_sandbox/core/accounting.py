@@ -22,9 +22,11 @@ The berry-mass book is separate from the nutrient book:
 
 with `bitten_mass` taken from `inflow[INFLOW_BITES].sum()` (the mass crossed
 from the berry book into the nutrient book).  For a one-tick segment the
-regeneration can be derived from the start state; for longer segments the
-caller must pass the summed regeneration explicitly (the engine does not keep a
-second berry-mass ledger in M0).
+regeneration can be derived from the start state and the M1 config values
+(`cfg.world.bush_regen_rate`, `cfg.world.bush_regen_base`) plus the same startup
+ramp multiplier as the environment; for longer segments the caller must pass
+the summed regeneration explicitly (the engine does not keep a second
+berry-mass ledger in M0).
 
 This module is host-side (numpy, float64) and observer-like: it never enters the
 pure-function state path, never consumes randomness and never writes state, so
@@ -37,12 +39,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from life_sandbox.core import components as C
+from life_sandbox.core import components as C, ramp
 
 RTOL: float = 1e-5
-# Mirror of the environment's berry regeneration (§4.2).
-BERRY_GROWTH: float = 0.03
-BERRY_SEED: float = 1e-4
 
 
 def _array(value) -> np.ndarray:
@@ -68,16 +67,22 @@ def berry_stock(state) -> float:
     return float((_array(ents.bush.edible.stock) * _array(ents.bush.alive)).sum())
 
 
-def berry_regeneration(state) -> float:
+def berry_regeneration(state, cfg) -> float:
     """Berry regeneration one environment tick produces from this state (§4.2).
 
-    The environment clips the stock to [0, 1]; the increment is therefore
-    min(growth, 1 - stock) per bush, which is mirrored here.
+    Mirrors environment.berry_growth exactly: the logistic increment
+    rate*stock*(1-stock) + base is scaled by ramp.berry_multiplier(tick, cfg),
+    then clipped to the [0, 1] stock range (so per bush the added mass is
+    min(increment, 1 - stock)).  The coefficients are the M1 config values
+    cfg.world.bush_regen_rate / bush_regen_base.
     """
     ents = state.entities
     stock = _array(ents.bush.edible.stock)
     alive = _array(ents.bush.alive)
-    growth = BERRY_GROWTH * stock * (1.0 - stock) + BERRY_SEED
+    rate = float(cfg.world.bush_regen_rate)
+    base = float(cfg.world.bush_regen_base)
+    multiplier = float(ramp.berry_multiplier(state.tick, cfg))
+    growth = (rate * stock * (1.0 - stock) + base) * multiplier
     added = np.minimum(growth, np.maximum(1.0 - stock, 0.0))
     return float((added * alive).sum())
 
@@ -196,6 +201,7 @@ def berry_books(
     start,
     end,
     result,
+    cfg,
     *,
     regeneration: float | None = None,
     rtol: float = RTOL,
@@ -203,11 +209,12 @@ def berry_books(
     """Berry-mass book: regeneration = bitten mass + delta stock (§3.5).
 
     `bitten` comes from `result.inflow[INFLOW_BITES].sum()`.  For a one-tick
-    segment `regeneration` defaults to the start state's regen; pass the summed
-    regeneration for longer segments.
+    segment `regeneration` defaults to the start state's regen (mirroring the
+    environment with the same cfg); pass the summed regeneration for longer
+    segments.
     """
     if regeneration is None:
-        regeneration = berry_regeneration(start)
+        regeneration = berry_regeneration(start, cfg)
     bitten = float(np.sum(_array(result.inflow[C.INFLOW_BITES])))
     return books(
         np.asarray([regeneration], dtype=np.float64),

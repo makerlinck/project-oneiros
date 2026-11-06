@@ -40,6 +40,9 @@ class WorldConfig:
     odor_diffusion: float = 0.2
     odor_decay: float = 0.02
     odor_scale: int = 1_000_000
+    bush_regen_rate: float = 0.03
+    bush_regen_base: float = 1e-4
+    temperature_scale: float = 1.0
     founders: int = 64
     # Startup ramp (SANDBOX.md §9): environment conditions interpolate from a
     # permissive state (tick 0) to the target values at ramp_ticks.  Values are
@@ -135,6 +138,23 @@ class LearningConfig:
 
 
 @dataclass(frozen=True)
+class BodyConfig:
+    """Body calibration knobs that M1 scans (SANDBOX.md §5.1--§5.3, §9)."""
+
+    base_metabolism: float = 0.002
+    founder_reserves: float = 0.5
+
+
+@dataclass(frozen=True)
+class ReproductionConfig:
+    """Reproduction control arms (SANDBOX.md §5.5, §9 M1)."""
+
+    # Control arm: every birth gets a fresh random genome instead of the parent's
+    # genome plus mutation.
+    randomize_genome: bool = False
+
+
+@dataclass(frozen=True)
 class MotionConfig:
     noise_scale: float = 1.0
 
@@ -147,6 +167,8 @@ class Config:
     sensors: Sensors = Sensors()
     brain: BrainConfig = BrainConfig()
     learning: LearningConfig = LearningConfig()
+    body: BodyConfig = BodyConfig()
+    reproduction: ReproductionConfig = ReproductionConfig()
     motion: MotionConfig = MotionConfig()
 
     @classmethod
@@ -198,6 +220,14 @@ class Config:
             raise ValueError("run.ticks must be >= 0 and run.segment_ticks > 0")
         if self.world.ramp_ticks < 0:
             raise ValueError("world.ramp_ticks must be >= 0")
+        if self.world.bush_regen_rate < 0 or self.world.bush_regen_base < 0:
+            raise ValueError("world bush regeneration parameters must be >= 0")
+        if self.world.temperature_scale <= 0:
+            raise ValueError("world.temperature_scale must be positive")
+        if self.body.base_metabolism <= 0:
+            raise ValueError("body.base_metabolism must be positive")
+        if not 0 < self.body.founder_reserves <= 1:
+            raise ValueError("body.founder_reserves must be in (0, 1]")
         for name in (
             "ramp_berry_multiplier",
             "ramp_metabolism_multiplier",

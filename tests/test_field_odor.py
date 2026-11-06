@@ -324,7 +324,7 @@ def test_environment_at_uses_the_ramped_temperature():
 
 
 def test_ramped_fields_trace_under_jit():
-    cfg = make_cfg(ramp_ticks=10)
+    cfg = make_cfg(ramp_ticks=10, temperature_scale=0.5)
     state = _put_creature(state_of(cfg), 0, [4.0, 2.0])
     state = _put_bush(state, 0, [4.0, 2.0], stock=0.5, kind=0)
     compiled = jax.jit(fields.apply, static_argnums=(1,))
@@ -333,10 +333,55 @@ def test_ramped_fields_trace_under_jit():
     assert out.fields.odor.shape == cfg.world.grid_shape + (CHANNELS,)
     assert int(buffer.count) == 0
 
+    # Inside a jitted function the ramp multiplier (0.2 at tick 0) and the
+    # calibrated temperature_scale (0.5) compose: 0.1x of the nominal amplitude.
     compiled_at = jax.jit(fields.environment_at, static_argnums=(1,))
-    temperature, _ = compiled_at(state, cfg)
-    base_temperature, _ = fields.environment_at(state, make_cfg())
+    temperature, light = compiled_at(state, cfg)
+    base_temperature, base_light = fields.environment_at(state, make_cfg())
     assert float(temperature[0]) == pytest.approx(
-        0.2 * float(base_temperature[0]), rel=1e-6, abs=1e-7
+        0.1 * float(base_temperature[0]), rel=1e-6, abs=1e-7
     )
+    assert float(light[0]) == pytest.approx(float(base_light[0]), rel=1e-6)
+
+
+def test_temperature_scale_scales_the_whole_amplitude():
+    nominal = make_cfg()
+    scaled = make_cfg(temperature_scale=0.5)
+    for tick in (0, 5, 10):
+        for y in (0.0, 4.0, 8.0):
+            base = float(fields.temperature(nominal, y, tick))
+            assert float(fields.temperature(scaled, y, tick)) == pytest.approx(
+                0.5 * base, rel=1e-6, abs=1e-7
+            ), (tick, y)
+    # The in-bush -0.5 offset is part of the amplitude, so it halves too.
+    assert float(fields.temperature(scaled, 4.0, 0, True)) == pytest.approx(
+        0.5 * float(fields.temperature(nominal, 4.0, 0, True)), rel=1e-6, abs=1e-7
+    )
+    # environment_at reads the scaled temperature; light is untouched.
+    nominal_state = _put_creature(state_of(nominal), 0, [4.0, 2.0])
+    scaled_state = _put_creature(state_of(scaled), 0, [4.0, 2.0])
+    base_temperature, base_light = fields.environment_at(nominal_state, nominal)
+    scaled_temperature, scaled_light = fields.environment_at(scaled_state, scaled)
+    assert float(scaled_temperature[0]) == pytest.approx(
+        0.5 * float(base_temperature[0]), rel=1e-6, abs=1e-7
+    )
+    assert float(scaled_light[0]) == pytest.approx(float(base_light[0]), rel=1e-6)
+
+
+def test_temperature_scale_and_ramp_compose():
+    nominal = make_cfg()
+    combined = make_cfg(ramp_ticks=10, temperature_scale=0.5)
+    # ramp_temperature_multiplier defaults to 0.2: at tick 0 the composed factor
+    # is 0.2 * 0.5 = 0.1, halfway through it is 0.6 * 0.5 = 0.3, and after the
+    # ramp the calibrated scale 0.5 remains.
+    for tick, factor in ((0, 0.1), (5, 0.3), (10, 0.5)):
+        base = float(fields.temperature(nominal, 4.0, tick))
+        assert float(fields.temperature(combined, 4.0, tick)) == pytest.approx(
+            factor * base, rel=1e-6, abs=1e-7
+        ), tick
+    # Light is affected by neither factor.
+    for tick in (0, 5, 10):
+        assert float(fields.light(combined, tick)) == pytest.approx(
+            float(fields.light(nominal, tick)), rel=1e-6
+        )
 

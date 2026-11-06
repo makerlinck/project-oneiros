@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
+import numpy as np
+import pytest
 
 from life_sandbox.brain.genome import layout
 from life_sandbox.config import Capacities, Config, RunConfig, WorldConfig
@@ -49,6 +51,35 @@ def test_widths_follow_the_brain_layout(tiny_cfg):
     assert creature.brain.e.shape[1] == lay.d
     assert creature.brain.h_prev.shape[1] == tiny_cfg.brain.h
     assert state.pain_weights.shape == (C.N_PAIN_SOURCES, C.N_PAIN_CHANNELS)
+
+
+def test_founder_genome_follows_initial_sigmas(tiny_cfg):
+    from life_sandbox.brain.genome import initial_sigmas
+    from life_sandbox.config import Capacities, Config, RunConfig, WorldConfig
+
+    cfg = Config.default().replaced(
+        capacities=Capacities(creature=64, bush=6, carcass=2, neutral=1),
+        world=WorldConfig(founders=64),
+        run=RunConfig(seed=5, ticks=0),
+    )
+    state = initial_state(cfg)
+    lay = layout(cfg)
+    sigma = np.asarray(initial_sigmas(cfg))
+    genome = np.asarray(state.entities.creature.genome.g[: cfg.world.founders])
+    for name in ("w_in", "w_err", "w_rec", "w_out", "w_mod", "g", "w_pred", "b_out"):
+        block = slice(*getattr(lay, name).indices(lay.total))
+        measured = float(np.std(genome[:, block]))
+        expected = float(np.mean(sigma[block]))
+        assert measured == pytest.approx(expected, rel=0.25), name
+
+
+def test_founder_reserves_follow_config(tiny_cfg):
+    from dataclasses import replace
+
+    cfg = replace(tiny_cfg, body=replace(tiny_cfg.body, founder_reserves=0.3))
+    state = initial_state(cfg)
+    reserves = np.asarray(state.entities.creature.body.N[0])
+    assert reserves.sum() == pytest.approx(0.3, rel=1e-5)
 
 
 def test_founder_tissue_follows_the_growth_rule(tiny_cfg):
