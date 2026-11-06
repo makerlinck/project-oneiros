@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -37,6 +38,7 @@ from life_sandbox.core.struct import update
 from life_sandbox.world.init import initial_state
 
 CHUNK = 128
+KNOB = 0.5  # scripted forager metabolic knob; CLI override for the temperature probe
 
 
 def _wrap(angle):
@@ -70,7 +72,7 @@ def forager_think(state, cfg):
         [
             jnp.where(in_range, -0.2, 1.0),  # approach, stop inside
             jnp.clip(error / 0.5, -1.0, 1.0),  # steer
-            jnp.full_like(theta, 0.5),  # metabolic knob
+            jnp.full_like(theta, KNOB),  # metabolic knob
             jnp.where(in_range & facing & hungry, 1.0, 0.0),  # bite
             zeros,  # grab
             zeros,  # drop
@@ -283,6 +285,14 @@ def design_config(args) -> Config:
         learning=LearningConfig(plasticity=False, prediction=False),
         run=RunConfig(seed=0, ticks=CHUNK, segment_ticks=CHUNK),
     )
+    if args.temperature_scale is not None:
+        cfg = cfg.replaced(
+            world=replace(
+                cfg.world,
+                temperature_scale=float(args.temperature_scale),
+                ramp_ticks=int(args.ramp_ticks),
+            )
+        )
     if args.arm == "control":
         cfg = cfg.replaced(reproduction=cfg.reproduction.__class__(randomize_genome=True))
     cfg.validate()
@@ -297,9 +307,13 @@ def main() -> None:
     parser.add_argument("--ramp-ticks", type=int, default=0)
     parser.add_argument("--cohort", type=int, default=512)
     parser.add_argument("--tiny", action="store_true")
+    parser.add_argument("--temperature-scale", type=float, default=None)
+    parser.add_argument("--knob", type=float, default=0.5)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
+    global KNOB
+    KNOB = float(args.knob)
     cfg = design_config(args)
     seeds = [9300 + i for i in range(args.worlds)]
     step_fn = forager_step if args.arm == "forager" else engine_step
