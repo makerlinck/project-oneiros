@@ -5,9 +5,9 @@ Random search over the calibration knobs agreed in the review:
     founder_reserves, ramp_ticks, temperature_scale.
 
 Round 1: N configs x W worlds x 20*L ticks, batched with vmap on one device.
-The batch is one config's worlds at a time; on a 3090, W=16 reaches ~2400
-world-ticks/s (measured), so a 24-config round is ~20-30 minutes including one
-compile per config (the segment equals one L chunk).
+The batch is one config's worlds at a time.  Throughput measurements and the
+narrowed feasibility ranges are exploratory results kept in
+results/001-m1-exploratory.md, not in code.
 Round 2: the best configs with more worlds plus the randomized-genome control.
 
 The driver is a host-side experiment script: it never changes the engine, seeds
@@ -130,10 +130,8 @@ def config_from_params(params: dict) -> Config:
 
 def sample_config(rng: random.Random, index: int) -> tuple[Config, dict]:
     """Draw one calibration config from the agreed round-1 space."""
-    # Ranges are the feasibility region measured by the 2026-11-06 micro-sweep:
-    # at base_metabolism <= 0.0002 with abundant food and mild temperature the
-    # populations stop relying on reseeds (metabolism 0.00018: 4 rescue episodes
-    # over 8 worlds x 5000 ticks, mean population 47.6).
+    # Ranges come from the 2026-11-06 feasibility micro-sweep, recorded in
+    # results/001-m1-exploratory.md (exploratory; not a code constant).
     bush_capacity = rng.choice([120, 180, 240])
     params = {
         "bush_regen_rate": round(rng.uniform(0.08, 0.12), 5),
@@ -162,10 +160,8 @@ def sample_config(rng: random.Random, index: int) -> tuple[Config, dict]:
         ),
         brain=BrainConfig(kind="plastic_rnn"),
         learning=LearningConfig(plasticity=False, prediction=False),
-        # Segment length is a throughput knob, but a 500-tick scan takes minutes
-        # of XLA compile per config (measured on the 3090), so the search uses
-        # 64-tick segments: compile is seconds and warmed throughput is ~2400
-        # world-ticks/s for 16 worlds.
+        # Segment length is a throughput knob; 64-tick segments keep the XLA
+        # compile per config short (measurements: results/001-m1-exploratory.md).
         run=RunConfig(seed=0, ticks=500, segment_ticks=64),
     )
     cfg.validate()
