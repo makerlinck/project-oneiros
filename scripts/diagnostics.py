@@ -49,6 +49,12 @@ BITE_FORCE = 1.0
 AVOID_TOXIN = False
 MIN_STOCK = 0.0
 AVOID_HOT = 0.0
+STATIONARY = False
+PIN_BUSH_STOCK = False
+SKIP_BITE_RATE = 0.0
+PINNED_BUSH_SLOTS = jnp.zeros((0,), dtype=jnp.int32)
+PINNED_POS = None
+PINNED_THETA = None
 
 
 def _wrap(angle):
@@ -138,7 +144,10 @@ def forager_think(state, cfg):
         )
         return jnp.where(jnp.any(jnp.isfinite(picked), axis=1, keepdims=True), picked, distance0)
 
-    pick = _pick(eligible, distance0, stocked)
+    if STATIONARY:
+        pick = distance0
+    else:
+        pick = _pick(eligible, distance0, stocked)
     slot0 = jnp.argmin(pick, axis=1)
     toxic_share = state.comp[C.TOXIN][bush.edible.kind]
     own_toxic = toxic_share[bush.edible.kind[slot0]] > 0.05
@@ -146,7 +155,8 @@ def forager_think(state, cfg):
     switch = own_toxic & needs_toxin
     non_toxic = eligible & (toxic_share[None, :] <= 0.05)
     alternative = _pick(non_toxic, distance0, stocked)
-    pick = jnp.where(switch[:, None], alternative, pick)
+    if not STATIONARY:
+        pick = jnp.where(switch[:, None], alternative, pick)
     distance = jnp.where(jnp.isfinite(pick), pick, 1e6)
     bush_slot = jnp.argmin(distance, axis=1)
     target = bush.transform.pos[bush_slot]
@@ -157,6 +167,8 @@ def forager_think(state, cfg):
     reach = self_radius + target_radius + 0.2
     in_range = jnp.linalg.norm(to_target, axis=1) <= reach
     facing = jnp.abs(error) <= jnp.deg2rad(30.0)
+    if STATIONARY:
+        facing = jnp.ones_like(facing)
     stomach = jnp.sum(creature.body.G, axis=1)
     hungry = stomach < 0.8 * 0.3
 
@@ -184,6 +196,11 @@ def forager_think(state, cfg):
         (ent_kind[nearest_entity] == C.BUSH) & (ent_local[nearest_entity] == bush_slot)
     )
     bite_ok = hungry & in_range & facing & bite_target_is_bush
+    if SKIP_BITE_RATE > 0.0:
+        slot = jnp.arange(n_creature, dtype=jnp.int32)
+        selector = (state.tick * 1103515245 + slot * 12345) % 100
+        skip = selector < int(SKIP_BITE_RATE * 100)
+        bite_ok = bite_ok & ~skip
 
     if KNOB_MODE == "zero":
         knob = jnp.zeros_like(theta)
@@ -202,10 +219,16 @@ def forager_think(state, cfg):
         knob = jnp.full_like(theta, KNOB)
 
     zeros = jnp.zeros_like(theta)
+    if STATIONARY:
+        accel = zeros
+        turn = zeros
+    else:
+        accel = jnp.where(in_range, -0.2, 1.0)
+        turn = jnp.clip(error / 0.5, -1.0, 1.0)
     outputs = jnp.stack(
         [
-            jnp.where(in_range, -0.2, 1.0),
-            jnp.clip(error / 0.5, -1.0, 1.0),
+            accel,
+            turn,
             knob,
             jnp.where(bite_ok, BITE_FORCE, 0.0),
             zeros,
@@ -245,12 +268,75 @@ def _world(states, index):
     return jax.tree.map(lambda value: value[index], states)
 
 
+def stationary_setup(states, cfg):
+    """Place each founder at the centre of its own bush (diagnostic only)."""
+    global PINNED_BUSH_SLOTS, PINNED_POS, PINNED_THETA
+    slots = jnp.arange(int(cfg.world.founders), dtype=jnp.int32)
+    PINNED_BUSH_SLOTS = slots
+    creature = states.entities.creature
+    for world in range(int(states.tick.shape[0])):
+        wstate = _world(states, world)
+        w_creature = wstate.entities.creature
+        bush = wstate.entities.bush
+        kinds = np.asarray(bush.edible.kind)
+        alive = np.asarray(bush.alive)
+        rho = np.asarray(diet_from_genome(w_creature.genome.g[: int(cfg.world.founders)], cfg))
+        comp = np.asarray(wstate.comp)
+        coverage = comp[None, :, :2] / np.maximum(rho[:, None, :2], 1e-6)
+        best_species = np.argmax(coverage.min(axis=-1), axis=1)
+        chosen = np.zeros(int(cfg.world.founders), dtype=np.int64)
+        for i, species in enumerate(best_species):
+            candidates = np.nonzero(alive & (kinds == species))[0]
+            chosen[i] = int(candidates[0]) if candidates.size else int(np.nonzero(alive)[0][0])
+        bush_pos = jnp.asarray(np.asarray(bush.transform.pos)[chosen])
+        transform = w_creature.transform
+        transform = update(
+            transform,
+            pos=transform.pos.at[slots].set(bush_pos),
+            theta=transform.theta.at[slots].set(0.0),
+            v=transform.v.at[slots].set(0.0),
+        )
+        w_creature = update(w_creature, transform=transform)
+        creature = jax.tree.map(
+            lambda stack, leaf: stack.at[world].set(leaf), creature, w_creature
+        )
+    PINNED_POS = creature.transform.pos
+    PINNED_THETA = creature.transform.theta
+    return update(states, entities=update(states.entities, creature=creature))
+
+
+def pin_stationary(states):
+    """Keep the stationary founders at their pinned positions (stacked worlds)."""
+    if PINNED_POS is None:
+        return states
+    creature = states.entities.creature
+    n = PINNED_BUSH_SLOTS.size
+    pinned = (jnp.arange(creature.alive.shape[1])[None, :] < n) & creature.alive
+    transform = creature.transform
+    transform = update(
+        transform,
+        pos=jnp.where(pinned[:, :, None], PINNED_POS, transform.pos),
+        theta=jnp.where(pinned, PINNED_THETA, transform.theta),
+        v=jnp.where(pinned, 0.0, transform.v),
+    )
+    creature = update(creature, transform=transform)
+    states = update(states, entities=update(states.entities, creature=creature))
+    if PIN_BUSH_STOCK:
+        bush = states.entities.bush
+        stock = jnp.where(bush.alive, 1.0, bush.edible.stock)
+        bush = update(bush, edible=update(bush.edible, stock=stock))
+        states = update(states, entities=update(states.entities, bush=bush))
+    return states
+
+
 def _scan_chunk(step_fn, states, cfg, size: int, collect: bool):
     batched = jax.vmap(lambda state: step_fn(state, cfg))
 
     def body(carry, _):
         current, totals = carry
         current, buffer = batched(current)
+        if STATIONARY:
+            current = pin_stationary(current)
         totals = totals + jax.vmap(_event_counts)(buffer)
         if collect:
             return (current, totals), (buffer, current.ledger)
@@ -288,9 +374,18 @@ def _flatten(buffers, world: int) -> dict:
 
 
 def run_worlds(
-    step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUNK, track: bool = False
+    step_fn,
+    cfg,
+    seeds,
+    ticks: int,
+    collect: bool,
+    chunk: int = CHUNK,
+    track: bool = False,
+    initial_hook=None,
 ) -> dict:
     states = _stack([initial_state(cfg, seed=seed) for seed in seeds])
+    if initial_hook is not None:
+        states = initial_hook(states, cfg)
     worlds = [
         {
             "births": {},        # uid -> (tick, reseed: bool, parent_uid)
@@ -369,15 +464,28 @@ def run_worlds(
                 creat = wstate.entities.creature
                 bush = wstate.entities.bush
                 diet = np.asarray(diet_from_genome(creat.genome.g, cfg))
-                ratio = np.asarray(creat.body.N) / np.maximum(diet, 1e-6)
+                nutrients = np.asarray(creat.body.N)
+                ratio = nutrients / np.maximum(diet, 1e-6)
+                deficit = diet - nutrients
+                sum_n = np.asarray(jnp.sum(creat.body.N, axis=1))
+                theta = np.asarray(reproduction_system.theta_repro(creat, cfg))
+                mass = 0.3 + 0.7 * np.asarray(creat.body.mu)
+                tissue_need = np.asarray([0.0, 0.009, 0.021])  # c_flesh * 0.03
+                tissue_short = tissue_need[None, :] - nutrients
+                blocked = (sum_n >= theta) & (mass >= 1.0) & np.any(tissue_short > 0, axis=1)
+                blocked_nutrient = np.argmin(np.where(tissue_need > 0, nutrients / tissue_need, np.inf), axis=1)
                 tracker[world].append(
                     {
                         "tick": int(states.tick[world]),
                         "uid": np.asarray(creat.identity.uid),
                         "alive": np.asarray(creat.alive),
-                        "sum_n": np.asarray(jnp.sum(creat.body.N, axis=1)),
-                        "theta": np.asarray(reproduction_system.theta_repro(creat, cfg)),
+                        "sum_n": sum_n,
+                        "theta": theta,
+                        "mass": mass,
                         "limiting": np.argmin(ratio, axis=1),
+                        "limiting_absolute": np.argmax(deficit, axis=1),
+                        "blocked": blocked,
+                        "blocked_nutrient": blocked_nutrient,
                         "stock": np.asarray(bush.edible.stock),
                         "bush_alive": np.asarray(bush.alive),
                     }
@@ -555,6 +663,8 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
     track_summary = None
     if result.get("tracker"):
         max_ratio, ever_above, above_fractions, limiting_counts = [], 0, [], Counter()
+        absolute_limiting = Counter()
+        blocked_individuals, blocked_fractions, blocked_nutrients = 0, [], Counter()
         stock_means, low_stock = [], []
         for samples in result["tracker"]:
             stats = {}
@@ -568,17 +678,42 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
                     uid = int(sample["uid"][index])
                     ratio = float(sample["sum_n"][index] / max(float(sample["theta"][index]), 1e-6))
                     entry = stats.setdefault(
-                        uid, {"max": 0.0, "above": 0, "n": 0, "lim": Counter()}
+                        uid,
+                        {
+                            "max": 0.0,
+                            "above": 0,
+                            "n": 0,
+                            "lim": Counter(),
+                            "abs_lim": Counter(),
+                            "eligible": 0,
+                            "blocked": 0,
+                            "blocked_lim": Counter(),
+                        },
                     )
                     entry["max"] = max(entry["max"], ratio)
                     entry["above"] += int(ratio >= 1.0)
                     entry["n"] += 1
                     entry["lim"][int(sample["limiting"][index])] += 1
+                    entry["abs_lim"][int(sample["limiting_absolute"][index])] += 1
+                    if (
+                        sample["mass"][index] >= 1.0
+                        and sample["sum_n"][index] >= sample["theta"][index]
+                    ):
+                        entry["eligible"] += 1
+                        if bool(sample["blocked"][index]):
+                            entry["blocked"] += 1
+                            entry["blocked_lim"][int(sample["blocked_nutrient"][index])] += 1
             for entry in stats.values():
                 max_ratio.append(entry["max"])
                 ever_above += int(entry["above"] > 0)
                 above_fractions.append(entry["above"] / max(entry["n"], 1))
                 limiting_counts[entry["lim"].most_common(1)[0][0]] += 1
+                absolute_limiting[entry["abs_lim"].most_common(1)[0][0]] += 1
+                if entry["eligible"]:
+                    blocked_individuals += int(entry["blocked"] > 0)
+                    blocked_fractions.append(entry["blocked"] / entry["eligible"])
+                    for key, value in entry["blocked_lim"].items():
+                        blocked_nutrients[key] += value
         track_summary = {
             "individuals_tracked": len(max_ratio),
             "median_max_sumN_over_theta": float(np.median(max_ratio)) if max_ratio else None,
@@ -589,10 +724,29 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
             "limiting_nutrient_most_common": {
                 NUTRIENT_LABELS[key]: value for key, value in limiting_counts.items()
             },
+            "limiting_nutrient_absolute": {
+                NUTRIENT_LABELS[key]: value for key, value in absolute_limiting.items()
+            },
+            "blocked_reproduction": {
+                "individuals_with_eligible_time": len(blocked_fractions),
+                "individuals_ever_blocked": blocked_individuals,
+                "mean_blocked_fraction_of_eligible_time": (
+                    float(np.mean(blocked_fractions)) if blocked_fractions else None
+                ),
+                "blocking_nutrient_counts": {
+                    NUTRIENT_LABELS[key]: value for key, value in blocked_nutrients.items()
+                },
+            },
             "bush_stock_mean": float(np.mean(stock_means)) if stock_means else None,
             "bush_stock_below_0_1_fraction": float(np.mean(low_stock)) if low_stock else None,
         }
+    individual_ticks = float(np.sum(pop)) * CHUNK
+    harvest = float(np.asarray(result["ledger"]["inflow"])[:, C.INFLOW_BITES, :].sum())
+    demand = float(np.asarray(result["ledger"]["outflow"])[:, C.OUTFLOW_METABOLISM, :].sum())
     return {
+        "intake_per_individual_tick": harvest / max(individual_ticks, 1.0),
+        "demand_per_individual_tick": demand / max(individual_ticks, 1.0),
+        "individual_ticks": individual_ticks,
         "r0": r0,
         "first_birth_age": {
             "count": len(first_birth_ages),
@@ -694,19 +848,29 @@ def main() -> None:
     parser.add_argument("--founders", type=int, default=None)
     parser.add_argument("--tissue-from-b", action="store_true")
     parser.add_argument("--track", action="store_true")
+    parser.add_argument("--stationary", action="store_true")
+    parser.add_argument("--pin-bush-stock", action="store_true")
+    parser.add_argument("--skip-bite-rate", type=float, default=0.0)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
     global KNOB, KNOB_MODE, AVOID_TOXIN, MIN_STOCK, AVOID_HOT
+    global STATIONARY, PIN_BUSH_STOCK, SKIP_BITE_RATE
     KNOB = float(args.knob)
     KNOB_MODE = args.knob_mode
     AVOID_TOXIN = bool(args.avoid_toxin)
     MIN_STOCK = float(args.min_stock)
     AVOID_HOT = float(args.avoid_hot)
+    STATIONARY = bool(args.stationary)
+    PIN_BUSH_STOCK = bool(args.pin_bush_stock)
+    SKIP_BITE_RATE = float(args.skip_bite_rate)
     cfg = design_config(args)
     seeds = [9300 + i for i in range(args.worlds)]
     step_fn = forager_step if args.arm == "forager" else engine_step
-    result = run_worlds(step_fn, cfg, seeds, args.ticks, collect=True, track=args.track)
+    hook = stationary_setup if STATIONARY else None
+    result = run_worlds(
+        step_fn, cfg, seeds, args.ticks, collect=True, track=args.track, initial_hook=hook
+    )
     summary = summarize(cfg, result, seeds, args.cohort)
     summary["arm"] = args.arm
     summary["probe"] = {
@@ -715,6 +879,9 @@ def main() -> None:
         "avoid_toxin": AVOID_TOXIN,
         "min_stock": MIN_STOCK,
         "avoid_hot": AVOID_HOT,
+        "stationary": STATIONARY,
+        "pin_bush_stock": PIN_BUSH_STOCK,
+        "skip_bite_rate": SKIP_BITE_RATE,
     }
     summary["founder_animal_logit_mean"] = cfg.body.founder_animal_logit_mean
     summary["design"] = {
