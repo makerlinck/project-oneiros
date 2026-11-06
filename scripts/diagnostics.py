@@ -33,7 +33,6 @@ import numpy as np
 from life_sandbox.config import BrainConfig, Capacities, Config, LearningConfig, RunConfig, WorldConfig
 from life_sandbox.core import components as C
 from life_sandbox.core import events as events_mod
-from life_sandbox.core import ramp as ramp_mod
 from life_sandbox.core.state import population
 from life_sandbox.core.step import SYSTEMS, _event_counts, step as engine_step
 from life_sandbox.core.systems import reproduction as reproduction_system
@@ -120,7 +119,6 @@ def forager_think(state, cfg):
     # supply covers the animal demand with a 1.3x margin at full digestion.
     # Selection lives in analysis/probe.py so it can be unit tested.
     diet = diet_from_genome(creature.genome.g, cfg)  # (N, 3)
-    c_tot = cfg.body.base_metabolism * ramp_mod.metabolism_multiplier(state.tick, cfg)
     delta = bush.transform.pos[None, :, :] - pos[:, None, :]
     distance0 = jnp.where(bush.alive[None, :], jnp.linalg.norm(delta, axis=-1), jnp.inf)
     bush_slot = probe.select_bush_slot(
@@ -130,7 +128,6 @@ def forager_think(state, cfg):
         bush.alive,
         bush.edible.stock,
         distance0,
-        c_tot,
         creature.body.N[:, C.TOXIN],
         stationary=STATIONARY,
     )
