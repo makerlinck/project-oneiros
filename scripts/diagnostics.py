@@ -465,6 +465,7 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
     return {
         "event_counts": event_counts,
         "ledger_totals": ledger_totals,
+        "population_rows": pop.tolist(),
         "per_world": per_world,
         "population_final": pop[-1].tolist(),
         "population_min": pop.min(axis=0).tolist(),
