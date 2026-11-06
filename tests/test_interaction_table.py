@@ -16,7 +16,7 @@ from life_sandbox.config import Capacities, Config, MotionConfig
 from life_sandbox.core import components as C, events
 from life_sandbox.core.state import empty
 from life_sandbox.core.struct import update
-from life_sandbox.core.systems import interaction
+from life_sandbox.core.systems import death, interaction, metabolism
 
 N = 4
 NB = 4
@@ -209,6 +209,9 @@ def records(buffer) -> list[dict]:
                 "success": bool(buffer.success[i]),
                 "reason": int(buffer.reason[i]),
                 "same_lineage": bool(buffer.same_lineage[i]),
+                "cause": int(buffer.cause[i]),
+                "nutrient": int(buffer.nutrient[i]),
+                "loss": [float(v) for v in buffer.loss[i]],
             }
         )
     return out
@@ -290,6 +293,10 @@ def test_bite_living_target_damages_and_feeds():
     assert len(bites) == 1 and bites[0]["target_kind"] == C.CREATURE
     assert bites[0]["damage"] == pytest.approx(0.1, abs=1e-6)
     assert float(jnp.sum(out.ledger.inflow[C.INFLOW_BITES])) == 0.0
+    # §5.5 attribution: the applied bite damage is booked to LOSS_BITE and the
+    # acute-pain injury only keeps this tick's bite damage.
+    assert float(target.damage.loss[1, C.LOSS_BITE]) == pytest.approx(0.1, abs=1e-6)
+    assert float(target.damage.injury[1]) == pytest.approx(0.1, abs=1e-6)
 
 
 def test_bite_neutral_has_no_effect():
@@ -530,3 +537,45 @@ def test_drop_then_grab_same_tick():
     assert len(grabs) == 1 and grabs[0]["success"]
     assert int(out.entities.creature.grip.holding.slot[0]) == 1
     assert int(out.entities.neutral.held_by.slot[1]) == 0
+
+
+def test_bite_kill_is_not_rescued_by_body():
+    """A bite that takes I to 0 kills in the same tick; body may not repair it."""
+    cfg = small_cfg()
+    state = add_creature(
+        empty(cfg),
+        1,
+        pos=(11.0, 10.0),
+        reserves=(0.3, 0.3, 0.3),
+        integrity=0.05,
+    )
+    state = add_creature(state, 0, out=output_row(bite=1.0))
+    # Keep reseed uids disjoint from the hand-assigned victim/actor uids.
+    state = update(state, uid_counter=jnp.asarray(100, jnp.int32))
+    mid, _ = interaction.apply(state, cfg)
+    victim = mid.entities.creature
+    assert float(victim.body.I[1]) == 0.0
+    # applied = min(total damage 0.1, I 0.05) = 0.05
+    assert float(victim.damage.loss[1, C.LOSS_BITE]) == pytest.approx(0.05, abs=1e-6)
+
+    after_body, _ = metabolism.apply(mid, cfg)
+    victim = after_body.entities.creature
+    assert float(victim.body.I[1]) == 0.0  # I <= 0 at entry -> no repair
+    assert float(victim.damage.loss[1, C.LOSS_BITE]) > 0.0
+
+    out, buffer = death.apply(after_body, cfg)
+    # The slot may be reused by the reseed rescue; the victim's uid is gone.
+    alive_uids = {
+        int(uid)
+        for uid in out.entities.creature.identity.uid[out.entities.creature.alive]
+    }
+    assert 2 not in alive_uids
+    deaths = [row for row in of_kind(buffer, "death") if row["uid"] == 2]
+    assert len(deaths) == 1
+    death_event = deaths[0]
+    assert death_event["cause"] == events.cause_code("bite")
+    assert death_event["target_kind"] == C.CREATURE
+    assert death_event["target_uid"] == 1
+    assert not death_event["same_lineage"]
+    assert death_event["loss"][C.LOSS_BITE] > 0.0
+    assert death_event["nutrient"] == -1

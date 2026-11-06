@@ -18,7 +18,7 @@ from life_sandbox.config import BodyConfig, Capacities, Config, MotionConfig, Wo
 from life_sandbox.core import components as C, events
 from life_sandbox.core.state import empty
 from life_sandbox.core.struct import update
-from life_sandbox.core.systems import metabolism, reproduction
+from life_sandbox.core.systems import death, metabolism, reproduction
 
 N = 4
 FLESH = jnp.asarray([0.3, 0.7, 0.0], jnp.float32)
@@ -65,6 +65,7 @@ def body_state(
     u_eff=None,
     injury=0.0,
     a_inj=0.0,
+    loss=None,
 ):
     state = empty(cfg)
     cre = state.entities.creature
@@ -99,7 +100,15 @@ def body_state(
             mu=cre.body.mu.at[0].set(maturity),
         ),
         pain=update(cre.pain, a_inj=cre.pain.a_inj.at[0].set(a_inj)),
-        damage=update(cre.damage, injury=cre.damage.injury.at[0].set(injury)),
+        damage=update(
+            cre.damage,
+            injury=cre.damage.injury.at[0].set(injury),
+            loss=(
+                cre.damage.loss
+                if loss is None
+                else cre.damage.loss.at[0].set(jnp.asarray(loss, jnp.float32))
+            ),
+        ),
         genome=C.Genome(g=diet_genome(cfg, rho)),
         motor=update(
             cre.motor,
@@ -215,18 +224,20 @@ def test_unabsorbed_plant_and_animal_do_not_become_toxin():
 
 
 def test_deficiency_damage_and_cause():
-    """Missing reserves: I -= 5*sum(d_j), cause nutrition + nutrient (§5.1, §5.5)."""
+    """Missing reserves: I -= 5*sum(d_j), attributed to LOSS_NUTRITION (§5.1, §5.5)."""
     cfg = small_cfg()
     rho = (0.2, 0.5, 0.3)
     state = body_state(cfg, rho=rho, reserves=(0.0, 0.0, 0.0), integrity=1.0)
     out, _ = metabolism.apply(state, cfg)
     body = out.entities.creature.body
     required = jnp.asarray(rho) * cfg.body.base_metabolism  # no repair: sum N = 0
-    assert float(body.I[0]) == pytest.approx(
-        1.0 - 5.0 * cfg.body.base_metabolism, abs=1e-6
-    )
+    deficiency = 5.0 * jnp.sum(required)
+    assert float(body.I[0]) == pytest.approx(1.0 - float(deficiency), abs=1e-6)
     damage = out.entities.creature.damage
-    assert int(damage.cause[0]) == events.cause_code("nutrition")
+    assert int(jnp.argmax(damage.loss[0])) == C.LOSS_NUTRITION
+    assert float(damage.loss[0, C.LOSS_NUTRITION]) == pytest.approx(
+        float(deficiency), abs=1e-6
+    )
     assert int(damage.nutrient[0]) == int(jnp.argmax(required))
     # Actual consumption is required - deficit: nothing could be paid here.
     assert jnp.allclose(out.ledger.outflow[C.OUTFLOW_METABOLISM], 0.0, atol=1e-7)
@@ -353,7 +364,9 @@ def test_toxin_damage_is_delayed_by_one_tick():
     body = out.entities.creature.body
     assert float(body.X[0]) == pytest.approx(0.475, abs=1e-7)
     assert float(body.I[0]) == pytest.approx(1.0 - 0.01 * 0.5, abs=1e-6)
-    assert int(out.entities.creature.damage.cause[0]) == events.cause_code("toxin")
+    damage = out.entities.creature.damage
+    assert int(jnp.argmax(damage.loss[0])) == C.LOSS_TOXIN
+    assert float(damage.loss[0, C.LOSS_TOXIN]) == pytest.approx(0.01 * 0.5, abs=1e-7)
 
 
 def test_thermogenesis_and_thermal_damage():
@@ -373,12 +386,18 @@ def test_thermogenesis_and_thermal_damage():
     assert float(body.b[0]) == pytest.approx(expected_b, abs=1e-6)
     expected_damage = 0.002 * (abs(expected_b) - 1.0)
     assert float(body.I[0]) == pytest.approx(1.0 - expected_damage, abs=1e-6)
-    assert int(out_hot.entities.creature.damage.cause[0]) == events.cause_code("heat")
+    hot_damage = out_hot.entities.creature.damage
+    assert int(jnp.argmax(hot_damage.loss[0])) == C.LOSS_HEAT
+    assert float(hot_damage.loss[0, C.LOSS_HEAT]) == pytest.approx(
+        expected_damage, abs=1e-7
+    )
 
     freezing = body_state(cfg, temperature=-2.0, reserves=reserves)
     out_freezing, _ = metabolism.apply(freezing, cfg)
     body = out_freezing.entities.creature.body
-    assert int(out_freezing.entities.creature.damage.cause[0]) == events.cause_code("cold")
+    cold_damage = out_freezing.entities.creature.damage
+    assert int(jnp.argmax(cold_damage.loss[0])) == C.LOSS_COLD
+    assert float(cold_damage.loss[0, C.LOSS_COLD]) > 0.0
     assert float(body.I[0]) < 1.0
 
 
@@ -540,6 +559,140 @@ def test_metabolism_ramp_scales_only_base_demand():
         assert jnp.allclose(
             out.ledger.outflow[C.OUTFLOW_METABOLISM], jnp.asarray(rho) * demand, atol=1e-6
         ), tick
+
+
+def test_loss_decays_with_tau_and_keeps_the_larger_source():
+    """loss <- loss*exp(-1/50) before this tick's damage is added (§5.5)."""
+    cfg = small_cfg()
+    rho = (0.2, 0.5, 0.3)
+    reserves = (0.1, 0.1, 0.1)
+    decay = jnp.exp(-1.0 / C.DAMAGE_DECAY_TAU)
+
+    # Pure decay: no new source this tick.
+    state = body_state(
+        cfg, rho=rho, reserves=reserves, loss=(0.0, 1.0, 0.0, 0.0, 0.0)
+    )
+    out, _ = metabolism.apply(state, cfg)
+    damage = out.entities.creature.damage
+    assert float(damage.loss[0, C.LOSS_TOXIN]) == pytest.approx(float(decay), abs=1e-7)
+    assert int(jnp.argmax(damage.loss[0])) == C.LOSS_TOXIN
+
+    # A small source written later in the same tick does not override a larger
+    # decayed source: heat 1.0 * decay stays above the tiny cold damage.
+    state = body_state(
+        cfg,
+        rho=rho,
+        reserves=reserves,
+        temperature=-2.0,
+        loss=(0.0, 0.0, 1.0, 0.0, 0.0),
+    )
+    out, _ = metabolism.apply(state, cfg)
+    damage = out.entities.creature.damage
+    assert float(damage.loss[0, C.LOSS_HEAT]) == pytest.approx(float(decay), abs=1e-7)
+    assert float(damage.loss[0, C.LOSS_COLD]) > 0.0
+    assert int(jnp.argmax(damage.loss[0])) == C.LOSS_HEAT
+
+
+def test_decay_lets_new_damage_win_across_ticks():
+    """Previous toxin 1.0 decays to 0.98, so 0.99 nutrition damage wins (§5.5)."""
+    cfg = small_cfg().replaced(body=BodyConfig(base_metabolism=0.198))
+    rho = (0.2, 0.5, 0.3)
+    state = body_state(
+        cfg, rho=rho, reserves=(0.0, 0.0, 0.0), loss=(0.0, 1.0, 0.0, 0.0, 0.0)
+    )
+    out, _ = metabolism.apply(state, cfg)
+    damage = out.entities.creature.damage
+    decay = float(jnp.exp(-1.0 / C.DAMAGE_DECAY_TAU))
+    deficiency = 5.0 * cfg.body.base_metabolism  # 0.99
+    assert float(damage.loss[0, C.LOSS_TOXIN]) == pytest.approx(decay, abs=1e-6)
+    assert float(damage.loss[0, C.LOSS_NUTRITION]) == pytest.approx(
+        deficiency, abs=1e-6
+    )
+    assert int(jnp.argmax(damage.loss[0])) == C.LOSS_NUTRITION
+
+
+def test_chronic_toxin_does_not_win_over_larger_nutrition():
+    """A persistent tiny toxin damage never out-attributes larger starvation."""
+    cfg = small_cfg()
+    rho = (0.2, 0.5, 0.3)
+    state = body_state(cfg, rho=rho, reserves=(0.0, 0.0, 0.0))
+    for _ in range(150):
+        out, _ = metabolism.apply(state, cfg)
+        body = out.entities.creature.body
+        cre = update(
+            out.entities.creature,
+            body=update(
+                body,
+                I=body.I.at[0].set(1.0),
+                X=body.X.at[0].set(0.01),  # persistent trickle: 1e-4 damage/tick
+                N=body.N.at[0].set(jnp.zeros(3)),
+                G=body.G.at[0].set(jnp.zeros(3)),
+                b=body.b.at[0].set(0.0),
+                age=body.age.at[0].set(0),
+            ),
+        )
+        state = update(out, entities=update(out.entities, creature=cre))
+    damage = state.entities.creature.damage
+    nutrition = float(damage.loss[0, C.LOSS_NUTRITION])
+    toxin = float(damage.loss[0, C.LOSS_TOXIN])
+    assert nutrition > 0.0 and toxin > 0.0
+    assert int(jnp.argmax(damage.loss[0])) == C.LOSS_NUTRITION
+    assert nutrition > 50.0 * toxin
+
+    # Death from this state is attributed to nutrition.
+    victim = update(
+        state,
+        entities=update(
+            state.entities,
+            creature=update(
+                state.entities.creature,
+                body=update(state.entities.creature.body, I=jnp.zeros((N,), jnp.float32)),
+            ),
+        ),
+    )
+    _, buffer = death.apply(victim, cfg)
+    deaths = [
+        i for i in range(int(buffer.count)) if int(buffer.kind[i]) == events.kind_code("death")
+    ]
+    assert len(deaths) == 1
+    assert int(buffer.cause[deaths[0]]) == events.cause_code("nutrition")
+    assert int(buffer.nutrient[deaths[0]]) == int(jnp.argmax(jnp.asarray(rho)))
+
+
+def test_large_toxin_load_is_attributed_to_toxin():
+    cfg = small_cfg()
+    state = body_state(
+        cfg, rho=(0.2, 0.5, 0.3), reserves=(0.0, 0.0, 0.0), toxin=100.0
+    )
+    out, _ = metabolism.apply(state, cfg)
+    damage = out.entities.creature.damage
+    assert int(jnp.argmax(damage.loss[0])) == C.LOSS_TOXIN
+    _, buffer = death.apply(out, cfg)
+    deaths = [
+        i for i in range(int(buffer.count)) if int(buffer.kind[i]) == events.kind_code("death")
+    ]
+    assert len(deaths) == 1
+    assert int(buffer.cause[deaths[0]]) == events.cause_code("toxin")
+
+
+def test_integrity_zero_is_not_repaired():
+    """I <= 0 at body entry is dead already and must not be repaired (§5.2)."""
+    cfg = small_cfg()
+    rho = (0.2, 0.5, 0.3)
+    reserves = (0.2, 0.2, 0.2)  # repair resources exist
+    state = body_state(cfg, rho=rho, reserves=reserves, integrity=0.0)
+    out, _ = metabolism.apply(state, cfg)
+    body = out.entities.creature.body
+    assert float(body.I[0]) == 0.0
+    # The unrepaired tick charges only the base demand.
+    drop = jnp.asarray(reserves) - body.N[0]
+    assert jnp.allclose(drop, jnp.asarray(rho) * cfg.body.base_metabolism, atol=1e-6)
+    _, buffer = death.apply(out, cfg)
+    deaths = [
+        i for i in range(int(buffer.count)) if int(buffer.kind[i]) == events.kind_code("death")
+    ]
+    assert len(deaths) == 1
+    assert int(buffer.uid[deaths[0]]) == 1
 
 
 def test_metabolism_ramp_does_not_scale_repair():

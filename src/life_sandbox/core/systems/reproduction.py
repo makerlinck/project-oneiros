@@ -418,7 +418,6 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     )
     zero_damage = C.Damage.zeros(capacity)
     damage = C.Damage(
-        cause=_scatter_rows(creature.damage.cause, child_slots, success, zero_damage.cause),
         source_uid=_scatter_rows(
             creature.damage.source_uid, child_slots, success, zero_damage.source_uid
         ),
@@ -429,6 +428,7 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
             creature.damage.nutrient, child_slots, success, zero_damage.nutrient
         ),
         injury=_scatter_rows(creature.damage.injury, child_slots, success, zero_damage.injury),
+        loss=_scatter_rows(creature.damage.loss, child_slots, success, zero_damage.loss),
     )
     zero_motor = C.Motor.zeros(capacity)
     motor = C.Motor(

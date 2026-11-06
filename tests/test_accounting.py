@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 
 from life_sandbox.config import Capacities, Config, MotionConfig, RunConfig, WorldConfig
-from life_sandbox.core import accounting, components as C
+from life_sandbox.core import accounting, components as C, events
 from life_sandbox.core.state import empty
 from life_sandbox.core.step import run
 from life_sandbox.core.struct import update
@@ -275,8 +275,21 @@ def test_berry_regeneration_reads_config_and_mirrors_environment():
     )
 
 
-def _dead_creature(state, slot, uid, reserves, tissue):
+def _dead_creature(
+    state,
+    slot,
+    uid,
+    reserves,
+    tissue,
+    *,
+    loss=None,
+    nutrient: int = C.NO_REF,
+    source_uid: int = C.NO_REF,
+    same_lineage: bool = False,
+    age: int = 0,
+):
     cre = state.entities.creature
+    loss = [0.0] * C.N_DAMAGE_SOURCES if loss is None else loss
     cre = update(
         cre,
         alive=cre.alive.at[slot].set(True),
@@ -286,10 +299,38 @@ def _dead_creature(state, slot, uid, reserves, tissue):
             N=cre.body.N.at[slot].set(jnp.asarray(reserves, jnp.float32)),
             B=cre.body.B.at[slot].set(jnp.asarray(tissue, jnp.float32)),
             I=cre.body.I.at[slot].set(0.0),
+            age=cre.body.age.at[slot].set(age),
+        ),
+        damage=update(
+            cre.damage,
+            loss=cre.damage.loss.at[slot].set(jnp.asarray(loss, jnp.float32)),
+            nutrient=cre.damage.nutrient.at[slot].set(nutrient),
+            source_uid=cre.damage.source_uid.at[slot].set(source_uid),
+            same_lineage=cre.damage.same_lineage.at[slot].set(same_lineage),
         ),
         shape=update(cre.shape, mass=cre.shape.mass.at[slot].set(1.0)),
     )
     return update(state, entities=update(state.entities, creature=cre))
+
+
+def _event_rows(buffer) -> list[dict]:
+    rows = []
+    for i in range(int(buffer.count)):
+        rows.append(
+            {
+                "kind": int(buffer.kind[i]),
+                "uid": int(buffer.uid[i]),
+                "target_kind": int(buffer.target_kind[i]),
+                "target_uid": int(buffer.target_uid[i]),
+                "same_lineage": bool(buffer.same_lineage[i]),
+                "cause": int(buffer.cause[i]),
+                "nutrient": int(buffer.nutrient[i]),
+                "loss": [float(v) for v in buffer.loss[i]],
+                "success": bool(buffer.success[i]),
+                "reason": int(buffer.reason[i]),
+            }
+        )
+    return rows
 
 
 def test_crafted_tick_closes_with_all_body_categories():
@@ -352,6 +393,109 @@ def test_death_and_reseed_ledger():
     # The ledger closes the death+reseed tick as well.
     books = accounting.nutrient_books(state, out, result_from_ledger(out.ledger))
     assert books.closed, books
+
+
+def test_death_event_carries_loss_and_nutrient():
+    """The death event reports the decayed loss vector and the missing nutrient."""
+    cfg = small_cfg()
+    state = empty(cfg)
+    state = _dead_creature(
+        state, 0, 11, (0.2, 0.2, 0.2), (0.03, 0.07, 0.0),
+        loss=(0.7, 0.0, 0.0, 0.0, 0.0), nutrient=C.PLANT,
+    )
+    state = _dead_creature(
+        state, 1, 12, (0.2, 0.2, 0.2), (0.03, 0.07, 0.0),
+        loss=(0.0, 0.9, 0.0, 0.0, 0.0),
+    )
+    _, buffer = death.apply(state, cfg)
+    deaths = {
+        row["uid"]: row
+        for row in _event_rows(buffer)
+        if row["kind"] == events.kind_code("death")
+    }
+    assert set(deaths) == {11, 12}
+    first = deaths[11]
+    assert first["cause"] == events.cause_code("nutrition")
+    assert first["nutrient"] == C.PLANT
+    assert first["loss"] == pytest.approx([0.7, 0.0, 0.0, 0.0, 0.0], abs=1e-6)
+    second = deaths[12]
+    assert second["cause"] == events.cause_code("toxin")
+    assert second["nutrient"] == -1
+    assert second["loss"] == pytest.approx([0.0, 0.9, 0.0, 0.0, 0.0], abs=1e-6)
+
+
+def test_death_cause_is_the_largest_decayed_loss():
+    """Every loss source maps to its death cause; zero loss falls back to other."""
+    cfg = small_cfg()
+    expected = {
+        C.LOSS_NUTRITION: "nutrition",
+        C.LOSS_TOXIN: "toxin",
+        C.LOSS_HEAT: "heat",
+        C.LOSS_COLD: "cold",
+        C.LOSS_BITE: "bite",
+    }
+    for source, name in expected.items():
+        state = empty(cfg)
+        loss = [0.0] * C.N_DAMAGE_SOURCES
+        loss[source] = 1.0
+        state = _dead_creature(
+            state, 0, 21, (0.2, 0.2, 0.2), (0.03, 0.07, 0.0),
+            loss=loss,
+            nutrient=C.ANIMAL,
+            source_uid=7,
+            same_lineage=True,
+        )
+        _, buffer = death.apply(state, cfg)
+        events_rows = [
+            row for row in _event_rows(buffer) if row["kind"] == events.kind_code("death")
+        ]
+        assert len(events_rows) == 1, name
+        row = events_rows[0]
+        assert row["cause"] == events.cause_code(name)
+        assert row["loss"][source] == pytest.approx(1.0, abs=1e-6)
+        if name == "bite":
+            assert row["target_kind"] == C.CREATURE
+            assert row["target_uid"] == 7
+            assert row["same_lineage"]
+        if name == "nutrition":
+            assert row["nutrient"] == C.ANIMAL
+
+    # All-zero loss -> other; the age cap wins over any loss.
+    state = empty(cfg)
+    state = _dead_creature(state, 0, 22, (0.2, 0.2, 0.2), (0.03, 0.07, 0.0))
+    _, buffer = death.apply(state, cfg)
+    row = next(r for r in _event_rows(buffer) if r["kind"] == events.kind_code("death"))
+    assert row["cause"] == events.cause_code("other")
+
+    state = empty(cfg)
+    state = _dead_creature(
+        state, 0, 23, (0.2, 0.2, 0.2), (0.03, 0.07, 0.0),
+        loss=(0.0, 0.0, 6.0, 0.0, 0.0), age=2000,
+    )
+    _, buffer = death.apply(state, cfg)
+    row = next(r for r in _event_rows(buffer) if r["kind"] == events.kind_code("death"))
+    assert row["cause"] == events.cause_code("age")
+    assert row["nutrient"] == -1
+
+
+def test_reseed_records_birth_events():
+    """Each reseeded individual also gets a birth event with reason=reseed."""
+    cfg = small_cfg()
+    state = empty(cfg)
+    out, buffer = death.apply(state, cfg)
+    rows = _event_rows(buffer)
+    births = [row for row in rows if row["kind"] == events.kind_code("birth")]
+    reseeds = [row for row in rows if row["kind"] == events.kind_code("reseed")]
+    alive_uids = {
+        int(uid) for uid in out.entities.creature.identity.uid[out.entities.creature.alive]
+    }
+    assert len(births) == len(reseeds) == len(alive_uids) > 0
+    assert {row["uid"] for row in births} == alive_uids
+    assert {row["uid"] for row in reseeds} == alive_uids
+    for row in births:
+        assert row["reason"] == events.reason_code("reseed")
+        assert row["target_kind"] == C.NO_REF
+        assert row["success"]
 
 
 def test_birth_ledger():

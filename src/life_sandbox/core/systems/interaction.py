@@ -45,9 +45,11 @@ Documented decisions where SANDBOX.md is silent:
 - Living targets lose B, N and G proportionally (factor 1 - Q/|B+N+G| of the
   tick-start content); biters add their intake to the stomach afterwards.
   This fixed order keeps the update linear and deterministic.
-- Bite damage is booked in the `Damage` component (cause, source uid, same
-  lineage, injury).  The body system turns `injury` into acute pain (§5.6) and
-  the die system reads `cause` (§5.5).
+- Bite damage is booked in the `Damage` component: the actually applied amount
+  enters `loss[LOSS_BITE]`, `injury` keeps it for acute pain (§5.6), and the
+  source uid / same-lineage flag are kept for the death event.  The body system
+  decays and accumulates the loss vector, and the die system reports the largest
+  decaying source (§5.5).
 """
 
 from __future__ import annotations
@@ -120,7 +122,16 @@ def append_events_batch(buffer: events.EventBuffer, valid: jax.Array, **values) 
         array = getattr(buffer, name)
         value = values.get(name)
         if value is None:
-            fill = -1 if name == "nutrient" else 0
+            # Mirror events.append's defaults for the fields where zero is not
+            # the neutral value (death-only nutrient, no target, success).
+            if name == "nutrient":
+                fill = -1
+            elif name == "target_kind":
+                fill = C.NO_REF
+            elif name == "success":
+                fill = True
+            else:
+                fill = 0
             cast = jnp.full((batch,) + array.shape[1:], fill, dtype=array.dtype)
         else:
             cast = jnp.asarray(value, dtype=array.dtype)
@@ -732,10 +743,12 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     has_damage = (last_rank >= 0) & (applied > 0.0) & creature.alive
     source_slot = perm[jnp.clip(last_rank, 0, n - 1)]
     damage_state = creature.damage
+    # §5.5 attribution: only the damage actually applied (min(total, I)) is
+    # booked to LOSS_BITE; injury keeps this tick's bite damage for acute pain.
+    loss = damage_state.loss.at[:, C.LOSS_BITE].add(
+        jnp.where(creature.alive, applied, 0.0)
+    )
     damage_state = C.Damage(
-        cause=jnp.where(
-            has_damage, jnp.asarray(events.cause_code("bite"), jnp.int8), damage_state.cause
-        ).astype(jnp.int8),
         source_uid=jnp.where(
             has_damage, creature.identity.uid[source_slot], damage_state.source_uid
         ).astype(jnp.int32),
@@ -748,6 +761,7 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         injury=jnp.where(
             creature.alive, damage_state.injury + applied, damage_state.injury
         ).astype(jnp.float32),
+        loss=loss.astype(jnp.float32),
     )
     creature = update(creature, damage=damage_state)
 

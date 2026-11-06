@@ -7,14 +7,17 @@ conversions, and the reseed branch is entered through `jax.lax.cond`.
 
 Implements SANDBOX.md §5.5:
 - integrity zero (or below) means death;
-- the recorded cause is the last damage source: nutrition deficiency (with the
-  missing nutrient), a bite (with the same-lineage flag and the biter's uid),
-  toxin, heat or cold; the fallback age cap is 5*a_sen;
+- the recorded cause is the largest element of the decaying per-source damage
+  ledger `Damage.loss` (nutrition / toxin / heat / cold / bite; all-zero ->
+  other), with the fallback age cap 5*a_sen overriding it.  A nutrition cause
+  also reports the missing nutrient index; a bite cause also reports the
+  biter's uid and the same-lineage flag;
 - a carcass is spawned with n = B + 0.5*N + G; the other half of N is a loss;
 - whatever the dead creature held is put down in place, and a living holder of
   the dead creature releases it;
-- when fewer than 8 creatures remain, up to 32 random genomes are reseeded
-  (each seeded individual emits one `reseed` event, as agreed with the Lead).
+- when fewer than 8 creatures remain, up to 32 random genomes are reseeded;
+  each seeded individual emits one `reseed` event and one `birth` event with
+  reason `reseed` (so lifespan grouping sees the birth).
 
 Documented decisions (SANDBOX.md is silent):
 - Deaths are processed in creature-slot order; carcass slots are assigned in
@@ -200,13 +203,32 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
 
     # ------------------------------------------------------------ death event
     age_dead = creature.body.age >= AGE_CAP_FACTOR * A_SEN
+    loss = creature.damage.loss
+    source_index = jnp.argmax(loss, axis=1).astype(jnp.int32)
+    # LOSS_* order is (nutrition, toxin, heat, cold, bite); map it to the
+    # DEATH_CAUSES event codes (§5.5).
+    source_cause = jnp.asarray(
+        [
+            events.cause_code("nutrition"),
+            events.cause_code("toxin"),
+            events.cause_code("heat"),
+            events.cause_code("cold"),
+            events.cause_code("bite"),
+        ],
+        dtype=jnp.int8,
+    )[source_index]
+    has_loss = jnp.max(loss, axis=1) > 0.0
     cause = jnp.where(
-        age_dead,
-        jnp.asarray(events.cause_code("age"), jnp.int8),
-        creature.damage.cause,
+        has_loss, source_cause, jnp.asarray(events.cause_code("other"), jnp.int8)
     )
-    cause = jnp.where(cause == 0, jnp.asarray(events.cause_code("other"), jnp.int8), cause)
+    cause = jnp.where(age_dead, jnp.asarray(events.cause_code("age"), jnp.int8), cause)
     bite = cause == events.cause_code("bite")
+    nutrition_death = cause == events.cause_code("nutrition")
+    nutrient = jnp.where(
+        nutrition_death,
+        creature.damage.nutrient,
+        jnp.asarray(C.NO_REF, jnp.int8),
+    ).astype(jnp.int8)
     buffer = append_events_batch(
         buffer,
         dead,
@@ -215,11 +237,12 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         uid=creature.identity.uid,
         target_kind=jnp.where(bite, C.CREATURE, C.NO_REF).astype(jnp.int32),
         target_uid=jnp.where(bite, creature.damage.source_uid, C.NO_REF).astype(jnp.int32),
-        same_lineage=creature.damage.same_lineage,
+        same_lineage=jnp.where(bite, creature.damage.same_lineage, False),
         x=creature.transform.pos[:, 0],
         y=creature.transform.pos[:, 1],
         cause=cause,
-        nutrient=creature.damage.nutrient,
+        nutrient=nutrient,
+        loss=loss,
         success=jnp.ones((capacity,), dtype=jnp.bool_),
     )
 
@@ -357,11 +380,11 @@ def _reseed(
             x=creature.pain.x.at[index].set(zero_pain.x),
         ),
         damage=C.Damage(
-            cause=creature.damage.cause.at[index].set(zero_damage.cause),
             source_uid=creature.damage.source_uid.at[index].set(zero_damage.source_uid),
             same_lineage=creature.damage.same_lineage.at[index].set(zero_damage.same_lineage),
             nutrient=creature.damage.nutrient.at[index].set(zero_damage.nutrient),
             injury=creature.damage.injury.at[index].set(zero_damage.injury),
+            loss=creature.damage.loss.at[index].set(zero_damage.loss),
         ),
         grip=C.Grip(
             holding=C.Holding(
@@ -406,5 +429,18 @@ def _reseed(
         uid=uids,
         x=position[:, 0],
         y=position[:, 1],
+    )
+    # Reseeded individuals also get a birth event (reason = reseed) so the
+    # lives/lifespan tables see them as births like any other individual.
+    buffer = append_events_batch(
+        buffer,
+        seed_mask,
+        kind=events.kind_code("birth"),
+        tick=state.tick,
+        uid=uids,
+        x=position[:, 0],
+        y=position[:, 1],
+        reason=jnp.asarray(events.reason_code("reseed"), jnp.int8),
+        success=jnp.ones((n_seed,), dtype=jnp.bool_),
     )
     return state, buffer

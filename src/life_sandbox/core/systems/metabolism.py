@@ -21,16 +21,17 @@ Implements, in this fixed order (SANDBOX.md §3.3 step 9):
 
 Sleep pressure S, asleep, consolidation and the memory/recall surcharge are
 phase 2b (ARCHITECTURES.md §3): M0 keeps S = 0, asleep = False and no recall
-cost.  Death causes are booked into the Damage component (§5.5); the die system
-reads them.
+cost.  Per-source damage attribution is booked into Damage.loss (§5.5, decay
+tau = 50 ticks); the die system reports the largest decayed source.
 
 Documented decisions (SANDBOX.md is silent):
 - Toxin absorbed above N_cap is overflow (an accounting outflow), not a return
   to X; only the unabsorbed fraction (1 - eps_T)*delta_T reaches X (§5.1
   wording: "unabsorbed T becomes X", overflow is recorded separately).
-- Integrity is repaired only while I < 1 and sum(N) > 0.5; the repaired amount
-  is min(0.002, 1-I) and exactly that amount enters c_tot, split by rho
-  (§5.2, §5.3 "cost of repair if there was repair this tick").
+- Integrity is repaired only while 0 < I < 1 and sum(N) > 0.5; the repaired
+  amount is min(0.002, 1-I) and exactly that amount enters c_tot, split by rho
+  (§5.2, §5.3 "cost of repair if there was repair this tick").  I <= 0 at body
+  entry is already dead and is never rescued by a same-tick repair.
 - The motion part of c_tot uses the effective controls Motor.u_eff = u' (the
   noise-added, clipped outputs the motion system applied, §5.3), not the raw
   intended outputs; the bite surcharge uses the intended u_bite.
@@ -43,8 +44,12 @@ Documented decisions (SANDBOX.md is silent):
   is unavailable, the tick adds no mass.
 - "inside a bush" for shading is the centre within the bush radius; temperature
   uses world.fields.temperature (§4.3).
-- I is clamped to [0, 1]; causes are overwritten only by a source that actually
-  deals damage this tick, so the recorded cause is the last damage source.
+- I is clamped to [0, 1].  Damage sources accumulate independently in
+  Damage.loss: each tick decays the previous vector by exp(-1/50) and adds that
+  tick's deficiency / toxin / heat / cold damage (bite damage is added by the
+  interact system); the largest decayed source at death names the cause, so a
+  small later source can never overwrite a larger earlier one.  The first
+  nonzero nutrient index of the current deficiency is kept for the death event.
 """
 
 from __future__ import annotations
@@ -93,20 +98,6 @@ def in_bush(entities: C.Entities) -> jax.Array:
     return jnp.any(inside, axis=1)
 
 
-def _book_damage(damage: C.Damage, amount: jax.Array, cause: int) -> C.Damage:
-    """Record `cause` for rows where `amount` > 0 (last source wins)."""
-    hit = amount > 0.0
-    return C.Damage(
-        cause=jnp.where(hit, jnp.asarray(cause, jnp.int8), damage.cause).astype(jnp.int8),
-        source_uid=jnp.where(hit, jnp.asarray(C.NO_REF, jnp.int32), damage.source_uid).astype(
-            jnp.int32
-        ),
-        same_lineage=jnp.where(hit, False, damage.same_lineage),
-        nutrient=jnp.where(hit, jnp.asarray(C.NO_REF, jnp.int8), damage.nutrient).astype(jnp.int8),
-        injury=damage.injury,
-    )
-
-
 def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
     """Advance one tick of body physiology (SANDBOX.md §3.3 step 9)."""
     entities = state.entities
@@ -114,6 +105,11 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     alive = creature.alive
     body = creature.body
     last = creature.motor.last_out
+
+    # Attribution ledger (§5.5): decay last tick's sources first, then this
+    # function adds this tick's nutrition/toxin/heat/cold damage below.
+    damage = creature.damage
+    loss = damage.loss * jnp.exp(-1.0 / jnp.asarray(C.DAMAGE_DECAY_TAU, jnp.float32))
 
     knob = motor.intended_knob(state)
     asleep = body.asleep
@@ -164,10 +160,13 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         * jnp.where(asleep, 0.5, 1.0)
         * ramp.metabolism_multiplier(state.tick, cfg)
     )
-    # Repair only happens while integrity is below 1 and reserves can pay for
-    # it; the demand charges exactly the amount repaired this tick (§5.3).
+    # Repair only happens while integrity is strictly inside (0, 1) and
+    # reserves can pay for it; I <= 0 at body entry is already dead and must
+    # not be rescued by a same-tick repair ("0 < I < 1").  The demand charges
+    # exactly the amount repaired this tick (§5.3).
     repair = jnp.where(
         alive
+        & (body.I > 0.0)
         & (body.I < 1.0)
         & (jnp.sum(reserves, axis=1) > REPAIR_MIN_RESERVES),
         jnp.minimum(REPAIR_RATE, 1.0 - body.I),
@@ -206,19 +205,14 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     radius = 0.5 * jnp.sqrt(mass)
     maturity = jnp.clip((mass - 0.3) / 0.7, 0.0, 1.0)
 
-    # Assemble integrity in the documented order: deficiency, toxin, thermal.
-    damage = creature.damage
-    damage = _book_damage(damage, deficiency, events.cause_code("nutrition"))
-    damage = C.Damage(
-        cause=jnp.where(has_deficit, jnp.asarray(events.cause_code("nutrition"), jnp.int8), damage.cause).astype(jnp.int8),
-        source_uid=damage.source_uid,
-        same_lineage=damage.same_lineage,
-        nutrient=jnp.where(has_deficit, nutrient, damage.nutrient).astype(jnp.int8),
-        injury=damage.injury,
-    )
-    damage = _book_damage(damage, toxin_damage, events.cause_code("toxin"))
-    damage = _book_damage(damage, heat, events.cause_code("heat"))
-    damage = _book_damage(damage, cold, events.cause_code("cold"))
+    # Attribution (§5.5): accumulate this tick's damage per source on top of
+    # the decayed ledger.  Sources never overwrite one another; the largest
+    # decayed source at death names the cause.
+    loss = loss.at[:, C.LOSS_NUTRITION].add(jnp.where(alive, deficiency, 0.0))
+    loss = loss.at[:, C.LOSS_TOXIN].add(jnp.where(alive, toxin_damage, 0.0))
+    loss = loss.at[:, C.LOSS_HEAT].add(jnp.where(alive, heat, 0.0))
+    loss = loss.at[:, C.LOSS_COLD].add(jnp.where(alive, cold, 0.0))
+    nutrient = jnp.where(has_deficit, nutrient, damage.nutrient).astype(jnp.int8)
     integrity = jnp.clip(
         body.I
         + repair
@@ -230,15 +224,16 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         1.0,
     )
 
-    # 9. acute pain from this tick's bite injury (§5.6); injury is per tick.
+    # 9. acute pain from this tick's bite injury (§5.6); injury is per tick and
+    # only the interact system adds bite damage to it.
     a_inj = INJURY_DECAY * creature.pain.a_inj + INJURY_GAIN * damage.injury
     pain = update(creature.pain, a_inj=jnp.where(alive, a_inj, 0.0))
     damage = C.Damage(
-        cause=damage.cause,
         source_uid=damage.source_uid,
         same_lineage=damage.same_lineage,
-        nutrient=damage.nutrient,
+        nutrient=nutrient,
         injury=jnp.zeros_like(damage.injury),
+        loss=loss.astype(jnp.float32),
     )
 
     body = C.Body(
