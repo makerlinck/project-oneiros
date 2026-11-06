@@ -30,10 +30,10 @@ def coverage_scores(rho, comp):
     return ratios.min(axis=-1)
 
 
-def _rank_row(ranked, rank, kind, alive, stock, distance):
+def _rank_row(ranked, rank, kind, alive, stock, distance, stock_min):
     species = ranked[:, rank]
     eligible = alive[None, :] & (kind[None, :] == species[:, None])
-    stocked = eligible & (stock[None, :] >= STOCK_MIN)
+    stocked = eligible & (stock[None, :] >= stock_min)
     row = jnp.where(stocked, distance, jnp.inf)
     row = jnp.where(
         jnp.any(jnp.isfinite(row), axis=1, keepdims=True),
@@ -57,15 +57,16 @@ def select_bush_slot(
     distance,
     body_toxin,
     stationary: bool = False,
+    stock_min: float = STOCK_MIN,
 ):
     """Return the bush slot each creature targets (coverage rule, v3)."""
     if stationary:
         return jnp.argmin(jnp.where(alive[None, :], distance, jnp.inf), axis=1)
     scores = coverage_scores(rho, comp)
     ranked = jnp.argsort(-scores, axis=1)
-    top, _species = _rank_row(ranked, 0, kind, alive, stock, distance)
-    second, species_second = _rank_row(ranked, 1, kind, alive, stock, distance)
-    third, species_third = _rank_row(ranked, 2, kind, alive, stock, distance)
+    top, _species = _rank_row(ranked, 0, kind, alive, stock, distance, stock_min)
+    second, species_second = _rank_row(ranked, 1, kind, alive, stock, distance, stock_min)
+    third, species_third = _rank_row(ranked, 2, kind, alive, stock, distance, stock_min)
 
     toxic_per_species = comp[:, C.TOXIN]
     own_species = ranked[:, 0]

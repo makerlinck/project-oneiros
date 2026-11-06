@@ -36,6 +36,7 @@ from life_sandbox.core import events as events_mod
 from life_sandbox.core.state import population
 from life_sandbox.core.step import SYSTEMS, _event_counts, step as engine_step
 from life_sandbox.core.systems import reproduction as reproduction_system
+from life_sandbox.core.systems.metabolism import R_DIG
 from life_sandbox.analysis import probe
 from life_sandbox.core.struct import update
 from life_sandbox.world.init import diet_from_genome, initial_state
@@ -53,6 +54,7 @@ STATIONARY = False
 PIN_BUSH_STOCK = False
 SKIP_BITE_RATE = 0.0
 HUNGER_THRESHOLD = 0.8
+STOCK_MIN = 0.05
 PINNED_BUSH_SLOTS = jnp.zeros((0,), dtype=jnp.int32)
 PINNED_POS = None
 PINNED_THETA = None
@@ -130,6 +132,7 @@ def forager_think(state, cfg):
         distance0,
         creature.body.N[:, C.TOXIN],
         stationary=STATIONARY,
+        stock_min=STOCK_MIN,
     )
     target = bush.transform.pos[bush_slot]
     target_radius = bush.shape.radius[bush_slot]
@@ -320,23 +323,40 @@ def _scan_chunk(step_fn, states, cfg, size: int, collect: bool):
     batched = jax.vmap(lambda state: step_fn(state, cfg))
 
     def body(carry, _):
-        current, totals = carry
+        current, totals, stats = carry
         current, buffer = batched(current)
         if STATIONARY:
             current = pin_stationary(current)
         totals = totals + jax.vmap(_event_counts)(buffer)
+        creature = current.entities.creature
+        alive = creature.alive
+        mature = alive & (creature.body.mu >= 1.0)
+        juvenile = alive & ~mature
+        digested = R_DIG * jnp.sum(creature.body.G, axis=-1)
+        stats = stats + jnp.stack(
+            [
+                jnp.sum(jnp.where(juvenile, digested, 0.0), axis=1),
+                jnp.sum(jnp.where(mature, digested, 0.0), axis=1),
+                jnp.sum(juvenile, axis=1).astype(jnp.float32),
+                jnp.sum(mature, axis=1).astype(jnp.float32),
+            ],
+            axis=1,
+        )
         if collect:
-            return (current, totals), (buffer, current.ledger)
-        return (current, totals), None
+            return (current, totals, stats), (buffer, current.ledger)
+        return (current, totals, stats), None
 
     initial = jnp.zeros((states.tick.shape[0], len(events_mod.EVENT_KINDS)), dtype=jnp.int32)
+    zero_stats = jnp.zeros((states.tick.shape[0], 4), dtype=jnp.float32)
     if collect:
-        (states, totals), (buffers, ledgers) = jax.lax.scan(
-            body, (states, initial), None, length=size
+        (states, totals, maturity), (buffers, ledgers) = jax.lax.scan(
+            body, (states, initial, zero_stats), None, length=size
         )
-        return states, totals, buffers, ledgers
-    (states, totals), _ = jax.lax.scan(body, (states, initial), None, length=size)
-    return states, totals, None, None
+        return states, totals, buffers, ledgers, maturity
+    (states, totals, _maturity), _ = jax.lax.scan(
+        body, (states, initial, zero_stats), None, length=size
+    )
+    return states, totals, None, None, None
 
 
 def _flatten(buffers, world: int) -> dict:
@@ -391,6 +411,7 @@ def run_worlds(
     ]
     tracker = [[] for _ in seeds] if track else None
     dropped_events = 0
+    maturity_totals = np.zeros((len(seeds), 4), dtype=np.float64)
     totals = np.zeros((len(seeds), len(events_mod.EVENT_KINDS)), dtype=np.int64)
     ledger = {
         "inflow": np.zeros((len(seeds), C.N_INFLOW_CATEGORIES, C.N_NUTRIENTS), dtype=np.float64),
@@ -403,8 +424,9 @@ def run_worlds(
     jitted = jax.jit(lambda current: _scan_chunk(step_fn, current, cfg, chunk, collect))
     started = time.perf_counter()
     for _ in range(ticks // chunk):
-        states, counts, buffers, ledgers = jitted(states)
+        states, counts, buffers, ledgers, maturity = jitted(states)
         totals += np.asarray(counts)
+        maturity_totals += np.asarray(maturity, dtype=np.float64)
         dropped_events += int(np.asarray(buffers.dropped).sum())
         for name in ledger:
             ledger[name] += np.asarray(getattr(ledgers, name), dtype=np.float64).sum(axis=0)
@@ -492,6 +514,8 @@ def run_worlds(
         "tracker": tracker,
         "dropped_events": dropped_events,
         "founder_uids": founder_uids,
+        "maturity": maturity_totals,
+        "ticks": ticks,
     }
 
 
@@ -721,6 +745,48 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
         if founder_counts or repro_counts
         else None
     )
+    ticks = int(result.get("ticks", 0))
+    cutoff = ticks - 2000  # age cap = 5 * a_sen
+    trunc_n = {"founders": 0, "reproduction_born": 0}
+    trunc_births = {"founders": 0, "reproduction_born": 0}
+    if cutoff >= 0:
+        for world, data in enumerate(result["worlds"]):
+            trunc_n["founders"] += int(cfg.world.founders)
+            for _uid, (tick, reseed, _parent) in data["births"].items():
+                if not reseed and tick <= cutoff:
+                    trunc_n["reproduction_born"] += 1
+            for parent, count in data["births_by_parent"].items():
+                born = data["births"].get(parent)
+                born_tick = 0 if born is None else int(born[0])
+                if born_tick <= cutoff:
+                    key = "reproduction_born" if born is not None else "founders"
+                    trunc_births[key] += int(count)
+
+    def _trunc(group):
+        return {
+            "individuals": trunc_n[group],
+            "births": trunc_births[group],
+            "mean_r0": (
+                trunc_births[group] / trunc_n[group] if trunc_n[group] else None
+            ),
+        }
+
+    r0["cohort_truncated"] = {
+        "cutoff_tick": cutoff,
+        "rule": "only individuals born at or before tick_end - 2000 (age cap); all such lives are complete",
+        "founders": _trunc("founders"),
+        "reproduction_born": _trunc("reproduction_born"),
+        "all": {
+            "individuals": trunc_n["founders"] + trunc_n["reproduction_born"],
+            "births": trunc_births["founders"] + trunc_births["reproduction_born"],
+            "mean_r0": (
+                (trunc_births["founders"] + trunc_births["reproduction_born"])
+                / (trunc_n["founders"] + trunc_n["reproduction_born"])
+                if (trunc_n["founders"] + trunc_n["reproduction_born"])
+                else None
+            ),
+        },
+    }
     track_summary = None
     if result.get("tracker"):
         max_ratio, ever_above, above_fractions, limiting_counts = [], 0, [], Counter()
@@ -810,10 +876,30 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
     individual_ticks = float(np.sum(pop)) * CHUNK
     harvest = float(np.asarray(result["ledger"]["inflow"])[:, C.INFLOW_BITES, :].sum())
     demand = float(np.asarray(result["ledger"]["outflow"])[:, C.OUTFLOW_METABOLISM, :].sum())
+    maturity = np.asarray(result["maturity"], dtype=np.float64).sum(axis=0)
+    juvenile_ticks, mature_ticks = float(maturity[2]), float(maturity[3])
+    intake_by_maturity = {
+        "juvenile": {
+            "individual_ticks": juvenile_ticks,
+            "digested_mass": float(maturity[0]),
+            "digested_per_individual_tick": (
+                float(maturity[0]) / juvenile_ticks if juvenile_ticks else None
+            ),
+        },
+        "mature": {
+            "individual_ticks": mature_ticks,
+            "digested_mass": float(maturity[1]),
+            "digested_per_individual_tick": (
+                float(maturity[1]) / mature_ticks if mature_ticks else None
+            ),
+        },
+        "note": "digested = R_DIG * sum(G) accumulated per tick; equals intake over a lifetime",
+    }
     return {
         "intake_per_individual_tick": harvest / max(individual_ticks, 1.0),
         "demand_per_individual_tick": demand / max(individual_ticks, 1.0),
         "individual_ticks": individual_ticks,
+        "intake_by_maturity": intake_by_maturity,
         "individuals_export": individuals_export,
         "r0": r0,
         "first_birth_age": {
@@ -923,12 +1009,14 @@ def main() -> None:
     parser.add_argument("--pin-bush-stock", action="store_true")
     parser.add_argument("--skip-bite-rate", type=float, default=0.0)
     parser.add_argument("--hunger-threshold", type=float, default=0.8)
+    parser.add_argument("--stock-min", type=float, default=0.05)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
     global KNOB, KNOB_MODE, AVOID_TOXIN, MIN_STOCK, AVOID_HOT
-    global STATIONARY, PIN_BUSH_STOCK, SKIP_BITE_RATE, HUNGER_THRESHOLD
+    global STATIONARY, PIN_BUSH_STOCK, SKIP_BITE_RATE, HUNGER_THRESHOLD, STOCK_MIN
     HUNGER_THRESHOLD = float(args.hunger_threshold)
+    STOCK_MIN = float(args.stock_min)
     KNOB = float(args.knob)
     KNOB_MODE = args.knob_mode
     AVOID_TOXIN = bool(args.avoid_toxin)
@@ -956,6 +1044,7 @@ def main() -> None:
         "pin_bush_stock": PIN_BUSH_STOCK,
         "skip_bite_rate": SKIP_BITE_RATE,
         "hunger_threshold": HUNGER_THRESHOLD,
+        "stock_min": STOCK_MIN,
     }
     summary["founder_animal_logit_mean"] = cfg.body.founder_animal_logit_mean
     summary["design"] = {
