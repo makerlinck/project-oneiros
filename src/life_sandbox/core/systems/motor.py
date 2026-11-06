@@ -29,6 +29,9 @@ Documented decisions (SANDBOX.md is silent):
   same rule; bushes can never be held (§5.4).
 - omega stores the angular velocity actually applied this tick (proprioception,
   §5.6), not the previous raw output.
+- Motor.u_eff = [u_acc', u_turn'] is written for the systems that charge or
+  gate on the applied controls (§5.3): metabolism's motion cost and the
+  interaction escape rule read it instead of re-deriving the noise.
 """
 
 from __future__ import annotations
@@ -196,7 +199,15 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         v=jnp.where(alive, speed, transform.v),
         omega=jnp.where(alive, omega, transform.omega),
     )
-    creature = update(creature, transform=new_transform)
+    # Effective controls u' ([u_acc', u_turn']) for the systems that charge or
+    # gate on what motion actually applied (§5.3): store on Motor so body and
+    # interaction never re-derive the motion noise from the key.
+    u_eff = jnp.where(alive[:, None], jnp.stack([acc, turn], axis=1), 0.0)
+    creature = update(
+        creature,
+        transform=new_transform,
+        motor=update(creature.motor, u_eff=u_eff.astype(jnp.float32)),
+    )
     ents = update(ents, creature=creature)
     state = update(state, entities=ents)
     state = _follow_held(state)

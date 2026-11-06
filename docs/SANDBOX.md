@@ -1,6 +1,15 @@
 # Oneiros 生命沙箱：统一的演化与观测环境（ECS）
 
-> v0.9 · 2026-11-06 · 配套：`PRINCIPLES.md`、`ARCHITECTURES.md`
+> v0.10 · 2026-11-06 · 配套：`PRINCIPLES.md`、`ARCHITECTURES.md`
+>
+> **v0.10 的改动**
+> - 基因组宽度与快权重宽度由布局推出（§6.1、§6.3、§6.5）：B0 的 G=(H+N_OUT)×M、η/λ 按突触后单元各一份，含共享头合计 8354；配置里不再有 `genome_dim`/`plastic_dim`。
+> - 事件与营养账本改为 step 的输出：生产路径 `lax.scan` 逐 tick 交出事件缓冲与账本草稿，主机用 float64 累加；账本按 §3.5 分类记录流入、流出与内部转移，三类营养做真闭合检查。
+> - `uid` 改为 int32，接近 2^31 时报错停止（§3.1）。
+> - 碰撞至少迭代 2 次，直到最大残余重叠 < 1e-3，最多 12 次（§5.3）。
+> - 接触力定义为穿透深度（§3.2、§5.3）；灌木也带 `transform`（§3.2）。
+> - `BrainState` 字段改为 `h`、`s_hat`、`w_fast`、`e`、`h_prev`；Hebbian 的 pre/post 取同一 tick（§3.2、§6.1）。
+> - `readable_leak` 臂暂缓到 M3 第 3 阶段；配置校验会直接拒绝该开关（§5.6）。
 >
 > **v0.9 的改动**
 > - 加入睡眠这一身体状态，以及困倦压力 S。睡眠中身体输出无效、档位为 0、视野关闭、基础代谢减半、不写入切片队列；大脑做顺序回放与巩固（细节见 `ARCHITECTURES.md` 第 3 节）。
@@ -88,6 +97,8 @@
 - 开启 XLA 的确定性选项（例如 `--xla_gpu_deterministic_ops=true`，具体名称以所用版本为准）。
 - 场的沉积、接触力的累加这类可能多写一处的操作，用定点整数（int32，固定缩放）累加，结果与顺序无关。
 - 成对计算（碰撞、视线）写成稠密的成对数组，再沿固定的轴归约。
+- 连续量显式 float32，索引、计数与 uid 显式 int32；x64 关闭（§3.1 的 uid 上限由此而来）。
+- **确定性的口径。** 生产口径是 jit + `lax.scan`（`run.segment_ticks`，§3.3）；"逐位相同"只要求同一口径内成立。eager 只是参考实现，跨执行模式（eager vs jit、不同世界批大小）允许 float32 末位差异；运行记录必须写明提交、后端、jax/jaxlib 版本、XLA 标志与批大小（§7.2 runs 表），fork 与续跑在同一口径下进行。
 
 **备选 PyTorch。** 开启 `torch.use_deterministic_algorithms(True)`；系统同样写成纯函数风格；随机数同样按"系统 × tick"派生。
 
@@ -107,7 +118,7 @@
 | Neutral 中性物体 | 3 | 由脚本控制，用作对照刺激 |
 
 - **实体就是槽位下标。** `alive` 掩码表示槽位是否被占用。
-- **uid。** 每个实体有全局唯一的 `uid`（int64），由世界计数器分配，永不复用。槽位可以复用，uid 不可以。
+- **uid。** 每个实体有全局唯一的 `uid`（int32；x64 关闭，每个世界的计数器远低于 2^31），由世界计数器分配，永不复用。计数器进入 2^31 − 10^6 的余量区时必须报错停止，不得回绕。槽位可以复用，uid 不可以。
 - **引用。** 引用写成 `(原型 id, 槽位, uid)`，用于"手里拿着什么""被谁拿着"等。读取时核对 uid；如果不一致，说明槽位已被复用，引用作废，按"已放下"处理。
 - **出生。** 按顺序分配空闲槽位，一次写入全部组件，`uid = counter + rank`。
 - **死亡。** 把 `alive` 置为 False。下次占用这个槽位时，所有组件被整体覆盖。
@@ -117,17 +128,17 @@
 | 组件 | 字段 | 适用原型 |
 |---|---|---|
 | Identity | `uid`、`parent_uid`、`lineage_id`、`generation`、`birth_tick` | Creature（其他原型只有 `uid`） |
-| Transform | `pos[2]`（连续坐标）、`θ`、`v`（沿朝向的速度，可为负）、`ω`（上一 tick 的角速度） | Creature、Carcass、Neutral |
+| Transform | `pos[2]`（连续坐标）、`θ`、`v`（沿朝向的速度，可为负）、`ω`（上一 tick 的角速度） | Creature、Carcass、Neutral、Bush（灌木静止，速度与角速度恒为 0） |
 | Shape | `radius`、`mass` | 全部 |
 | Look | `rgb[3]`、`odor[C_o]` | 全部（墙没有气味） |
 | Body | `G[3]`（胃内容物）、`N[3]`（营养储量）、`B[3]`（身体组织）、`I`、`X`（毒素负荷）、`b`（核心体温）、`k`、`p`（档位的滞后量）、`φ_hb`（心跳相位）、`S`（困倦压力）、`asleep`、`age`、`μ`（成熟度） | Creature |
 | Pain | `a_inj`（急性痛强度）、`x[9, 2]`（各噪声源载波的 AR(2) 状态） | Creature |
 | Grip | `holding` 引用、`held_by` 引用 | Creature 两个字段都有；Carcass、Neutral 只有 `held_by` |
-| Contact | `touch[4]`（前、右、后、左四个象限上一 tick 的接触力） | Creature |
+| Contact | `touch[4]`（前、右、后、左四个象限上一 tick 的接触力；其中"接触力"定义为碰撞求解前的初始穿透深度，含撞墙越界深度） | Creature |
 | Edible | Bush：`stock`（浆果质量）、`kind`；Carcass：`n[3]`、`age_dead` | Bush、Carcass |
 | Genome | `g[G]` | Creature |
-| Brain | `h[H]`、`s_hat[D]`、`w_fast[P]`、上一 tick 的 pre/post | Creature |
-| Motor | `last_out[6]` | Creature |
+| Brain | `h[H]`、`s_hat[D]`、`w_fast[P]`、`e[D]`（think 算出的 e_t）、`h_prev[H]`（h_{t−1}） | Creature |
+| Motor | `last_out[6]`（意图输出）、`u_eff[2]`（加噪并裁剪后的有效前后加速度与转向角速度） | Creature |
 | Scripted | 游走策略的状态 | Neutral |
 | Focal | `trace_slot` | Creature，只供观测用，智能体不可见 |
 
@@ -138,7 +149,8 @@
 - 各种浆果当前的营养组成 `comp[F, 3]`；
 - 痛觉束载荷 `w_pain[9, 4]`，每次运行生成一次；
 - 时钟 `tick`、uid 计数器；
-- 世界边界（矩形墙）。
+- 世界边界（矩形墙）；
+- 营养账本草稿 `Ledger`：每 tick 由 step 清零，各系统在流动发生处累加流入、流出与内部转移（§3.5）。它是记账与观测的基础设施，智能体不可见。
 
 ### 3.3 系统与调度
 
@@ -157,7 +169,7 @@
  9 body         消化与吸收；代谢扣减与营养缺乏；毒素伤害；产热与体温；生长；衰老；档位滞后量与心跳相位；急性痛强度；困倦压力 S；睡眠中的突触巩固
 10 reproduce    分裂，子代放在亲代身后的空位
 11 die          判定死亡；生成尸体；释放持有物和被持有者
-12 events       把本 tick 的事件写入定长、带掩码的缓冲区
+12 events       组装本 tick 的定长、带掩码事件缓冲；它与同 tick 的账本草稿一起作为 lax.scan 的逐 tick 输出交给主机（不写入世界状态）
 ```
 
 - 每个系统是否启用、参数取什么值，都由配置决定；执行顺序固定。
@@ -179,7 +191,13 @@
 - **流出：** 代谢扣减；未被吸收的部分（植物质和动物质排出，毒素转为毒素负荷后离开营养账）；储量溢出；出生损耗；尸体分解；死亡时没有进入尸体的那部分储量。
 - **内部转移：** 尸体腐败时，植物质和动物质转化为毒素；消化时，营养从 G 转入 N。两者都单独记录。
 
-每段结束时检查：`流入 = 流出 + Δ存量`，每类营养的相对误差都要小于 1e-5。
+**账本实现（不进入智能体）。** `WorldState` 里有一个每 tick 清零的 `Ledger` 草稿区：
+
+- 流入分类：咬灌木（`bites`）、重播种注入（`reseed`）；
+- 流出分类：代谢（`metabolism`）、排出（`excretion`）、溢出（`overflow`）、毒素转入负荷 X（`toxin_load`）、出生损耗（`birth_loss`）、死亡损耗（`death_loss`）、分解（`decomposition`）；
+- 内部转移：尸体腐败的植物质/动物质 → 毒素记在 `transfer_from`/`transfer_to`；消化 G → N 记 `digested`（同类守恒，仅作诊断）。
+
+每段结束时用账本总量检查 `流入 = 流出 + Δ存量`，每类营养的相对误差 < 1e-5；内部转移另查 `Σtransfer_from = Σtransfer_to`。账本随 step 作为 scan 输出交出，主机用 float64 累加，不在状态里跨 tick 累计。
 
 ---
 
@@ -238,7 +256,7 @@
 | 场 | 通道 | 更新方式 | 采样方式 |
 |---|---|---|---|
 | 温度 T | 1 | 解析式：`T = T_geo(y) + 0.5·cos(2πt/T_day) − 0.5·[在灌木内]`，其中 `T_geo(y) = −2 + 4·y/64` | 用于皮肤温差 `T − b`，取身体中心的值 |
-| 光照 L | 1 | 解析式：`L = (0.5 + 0.5·cos(2πt/T_day))·(1 − 0.5·[在灌木内])` | 取身体中心的值；同时决定视野的亮度和噪声 |
+| 光照 E | 1 | 解析式：`E = (0.5 + 0.5·cos(2πt/T_day))·(1 − 0.5·[在灌木内])` | 取身体中心的值；同时决定视野的亮度和噪声（符号改用 E，L 专指寿命） |
 | 气味 O | C_o = 4 | 网格：`c ← (1 − δ)·diffuse(c) + 沉积`，扩散核 3×3，D = 0.2，δ = 0.02；用定点整数累加沉积 | 一个鼻子，位于正前方、距中心 r + 0.2 处，用双线性插值读取 |
 | 声音 S（第 6 阶段） | S = 2 | 不存网格，逐对计算：幅度为 `max(0, u_snd)`，接收量为 `Σ 幅度 · exp(−d/4)`，只计 d < 10 的声源 | 两只耳朵分别位于 θ ± 90° |
 
@@ -354,13 +372,14 @@ v      ← (v + a_max·u'_acc)·(1 − 0.1)，再裁剪到 |v| ≤ 0.5·(1 + 0.5
 pos    ← pos + v·(cos θ, sin θ)
 ```
 
+- **有效控制 u'。** 加噪并裁剪后的前后加速度与转向角速度记作 u'，由 motion 写入 `Motor.u_eff`；代谢计费与交互判定读它，不再各自重推导噪声。
 - **非线性。** 加速度要经过速度积分，还要扣掉阻力，所以输出与效果之间不是线性关系，也不是即时生效的。
 - **受伤只能从控制误差中察觉。** 完整度不进入切片。它通过 c_I 和 σ_m 削弱推进、转向、咬和握，并放大运动噪声。传出副本记录了"想做的"，本体感觉和触觉记录了"做到的"，两者之间的差异，就是系统能得到的全部受伤信息。g 同时用于 5.4 节的咬与握。
 - **碰撞。**
-  - 积分之后，把互相重叠的实体沿法线方向、按质量比例推开，迭代 2 次。
+  - 积分之后，把互相重叠的实体沿法线方向、按质量比例推开：规格下限是 2 次迭代，之后继续迭代直到最大残余重叠 < 1e-3，上限 12 次；达到上限时计数，供观测与验收使用。
   - 不参与碰撞的：被拿着的实体；生命体与灌木之间。
   - 撞墙时，位置裁剪回边界内，速度减半。
-  - 每个个体按朝向，把接触力分到前、右、后、左四个象限，作为下一 tick 的触觉输入。
+  - 接触力定义为碰撞求解前的初始穿透深度（含撞墙越界深度）。按接触点方向相对朝向的夹角分到前、右、后、左四个象限（右转为正），作为下一 tick 的触觉输入。
 
 **每 tick 的代谢需求：**
 
@@ -369,7 +388,7 @@ c_tot = 0.002·(1 + 3k²)·(1 + 衰老加成)·(睡眠时 × 0.5)
       + 0.002·|u'_acc|·(1 + k)·(m + m_held)
       + 0.0005·|u'_turn|
       + 0.002·max(0, u_bite)
-      + 修复完整度的消耗（如果当 tick 有修复）
+      + 修复完整度的消耗（仅当 I < 1 且 ΣN > 0.5 时修复；修复量 = min(0.002, 1 − I)，只计实际修复量）
       + 记忆与回想的代价（ARCHITECTURES 2.4）
 ```
 
@@ -428,7 +447,7 @@ c_tot = 0.002·(1 + 3k²)·(1 + 衰老加成)·(睡眠时 × 0.5)
 | 本体感觉 | 2 | 当前速度 v；上一 tick 的实际角速度 |
 | 内感受 | 6 | 胃的充盈程度 \|G\|₁；痛觉束 4 路（见下）；心跳 1 路 |
 | 皮肤温差 | 1 | `T(所在位置) − b`，加噪声。外界比身体热时为正，比身体冷时为负 |
-| 光照 | 1 | 所在位置的 L |
+| 光照 | 1 | 所在位置的 E |
 | 传出副本 | 6 | 上一 tick 的 6 个输出 |
 | 合计 D | 70 | 第 6 阶段追加 2 × S = 4 维声音，合计 74 |
 
@@ -438,7 +457,7 @@ c_tot = 0.002·(1 + 3k²)·(1 + 衰老加成)·(睡眠时 × 0.5)
 像素 i（0…14，从左到右）的方向：φ_i = θ − 30° + (i + 0.5)·4°
 沿 φ_i 投射一条射线，最远 R_view = 16：
   命中最近的实体圆或墙 → 颜色 c，距离 d
-  RGB_i = c · exp(−d/6) · L + N(0, σ_v²)，σ_v = 0.02 + 0.08·(1 − L)
+  RGB_i = c · exp(−d/6) · E + N(0, σ_v²)，σ_v = 0.02 + 0.08·(1 − E)
   没有命中 → RGB_i = 0，再加噪声
 射线忽略：自己、自己手里的东西、自己所在的那丛灌木
 墙的颜色为灰色
@@ -452,7 +471,7 @@ c_tot = 0.002·(1 + 3k²)·(1 + 衰老加成)·(睡眠时 × 0.5)
 
 身体状态都不进入切片，包括营养储量 N、完整度 I、毒素负荷 X、核心体温 b。系统只能通过三条途径感到它们：痛觉束里的噪声、心跳的节律（5.2），以及控制误差（5.3）。
 
-痛觉束是 4 路共用的内感受通道。九个噪声源叠加在里面，每个源的强度来源、波形和周期都不同：
+痛觉束是 4 路共用的内感受通道（通道数是内感受束的物理属性，与嗅觉通道数无关）。九个噪声源叠加在里面，每个源的强度来源、波形和周期都不同：
 
 | 噪声源 | 强度 a_k（由身体状态算出，不进入切片） | 波形 | 周期 P_k | 阻尼 r_k |
 |---|---|---|---|---|
@@ -497,7 +516,8 @@ c_tot = 0.002·(1 + 3k²)·(1 + 衰老加成)·(睡眠时 × 0.5)
   2. 完整度 I；
   3. 毒素负荷 X；
   4. 核心体温 b；
-  5. 半径 3 以内是否有在过去 50 tick 里咬伤过活体的个体（用真实值）。
+  5. 半径 3 以内是否有在过去 50 tick 里咬伤过活体的个体（用真实值；记录的是咬人者一方，需要一个独立的每体 `last_live_bite_tick` 组件，所有臂都由 interact 写入）。
+  - 该臂暂缓到 M3 第 3 阶段；在此之前配置校验直接拒绝 `learning.readable_leak=true`（不再等到 trace 时才失败）。
 - **`no_body_loop` 臂：**
   - 心跳固定为静息频率（周期 20 tick）；
   - 传出副本里去掉档位；
@@ -544,6 +564,8 @@ W_slow 的初值取自基因组，清醒时不变；睡眠中巩固：W_slow += 
   | W_rec | h_{t−1} | h_t |
   | W_out | h_t | out_t |
 
+- **粒度与时机。** 调制量 m̃_j、η_j 与 λ_j 都按突触后单元给出：隐单元 H 个 + 输出单元 N_OUT 个，所以 G 的形状是 (H + N_OUT) × M；A–D 按三组权重（W_in、W_rec、W_out）。Hebbian 的 pre/post 取同一 tick（即上表）：“上一 tick 的 pre/post”是旧写法，作废。
+
 ### 6.2 臂（只是配置）
 
 | 臂 | 可塑性 | 预测与误差单元 | η 的粒度 | 泄漏 | 检验 |
@@ -562,12 +584,14 @@ W_slow 的初值取自基因组，清醒时不变；睡眠中巩固：W_slow += 
 
 **基因组包括：**
 
-- 全部 W^genome 与偏置，以及 W_mod、G；
+- 全部 W^genome 与偏置，以及 W_mod、G（G 的形状是 (H + N_OUT) × M）；
 - 每个单元的 η_j、λ_j、ρ_j（以对数存储；ρ_j 是睡眠中的巩固率）；
 - 每组权重的 A–D 与 η_p；
 - 繁殖阈值 θ_repro；
 - 体色（3 维）、气味谱（C_o 维）；
 - 食性 logit（3 维；decoupled 模式下另加 3 维 ψ）。
+
+**宽度由布局推出。** 基因组宽度与快权重宽度不是配置项：由 H、D、M 和输出数按上面的块顺序累加得出（共享头见 6.5 节），D 变化时所有数组随之改变。可塑权重只包含 W_in、W_rec、W_out、W_pred 四个矩阵。
 
 **初始化：** 创始个体用缩放的随机正态分布初始化，不预先设计任何接线。食性 logit 的初始分布见 5.1 节。
 
@@ -603,9 +627,10 @@ W_slow 的初值取自基因组，清醒时不变；睡眠中巩固：W_slow += 
 | W_in、W_err、W_pred | 各 2,240 |
 | W_rec | 1,024 |
 | W_out 与 w_k | 192 |
-| W_mod、G | 各 128 |
-| 偏置、可塑性参数、θ_repro、体色、气味谱、食性 | 约 138 |
-| 基因组合计 | 约 8.3k |
+| W_mod | 128 |
+| G（38 × 4，调制按突触后单元） | 152 |
+| 偏置、可塑性参数（η/λ 各 38，A–D 12，η_p 1）、θ_repro、体色、气味谱、食性 | 138 |
+| 基因组合计（含共享头 11） | 8354 |
 | 可塑权重（W_in、W_rec、W_out、W_pred） | 约 5.7k |
 
 - **内存：** 每个个体约 14k 个 fp32，约 56 KB。64 个世界 × 256 个槽位 = 16,384 个个体，约 1 GB，还有余量把 H 提到 64。
@@ -697,14 +722,14 @@ fork(snapshot, patches, n_ticks) → (treated_run, control_run)
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| M0 引擎核心 | ECS 状态、调度、随机数、连续物理、场、视野、营养规则、判定表；用随机输出驱动生命体 | 同一种子跑 3 次哈希相同；观测开关不影响哈希；三类营养分别记账闭合；碰撞后残余重叠 < 1e-3；视野通过标准场景；气味场在 δ = 0 时守恒；营养规则与判定表逐格有单元测试；槽位复用后引用正确失效；实测吞吐 |
+| M0 引擎核心 | ECS 状态、调度、随机数、连续物理、场、视野、营养规则、判定表；用随机输出驱动生命体 | 同一种子跑 3 次哈希相同；观测开关不影响哈希；三类营养按 Ledger 流水真闭合（相对误差 < 1e-5，含内部转移守恒）；事件与账本在 jit+scan 生产路径上逐 tick 交出，与 eager 一致；碰撞后残余重叠 < 1e-3；视野通过标准场景；气味场在 δ = 0 时守恒；营养规则与判定表逐格有单元测试；槽位复用后引用正确失效；uid 接近上限时报错；实测吞吐 |
 | M1 世界标定（第 0 阶段） | 用 `fixed` 臂演化，调整灌木再生、代谢、温度、营养组成等参数 | 爬坡后 ≥ 90% 的世界能持续 ≥ 20·L；槽位上限被触及的 tick < 5%；营养缺乏导致的死亡不超过全部死亡的 70%；稳态下出生约等于死亡；"每次出生都重新随机化基因组"的对照明显更差；测出 L；报告食性分布与食物网（只报告，不以出现某种生态位为通过条件）；形成标定记录并提交 |
 | M2 大脑与观测 | 全部臂、观测器、快照 | 零差异检查通过；续跑逐位相同；`readable` 正确标为泄漏；切片布局通过静态检查 |
 | M3 第 1 阶段（H0） | 按预注册运行 | 按预注册 |
 | M4 干预与分析库 | fork、patch、配对分析，生成标准报告 | 空 patch 的 fork 与对照逐位相同 |
 | M5 社会与信号 | altricial 模式；声音场 | 按预注册 |
 
-**起步爬坡：** 随机初始化的创始个体很可能马上灭绝。前 `T_ramp` 个 tick 里，让世界从宽松状态逐步过渡到目标参数，例如浆果更多、代谢更低、温差更小、毒素含量为 0。这里只调整环境条件，不设计行为。
+**起步爬坡：** 随机初始化的创始个体很可能马上灭绝。前 `ramp_ticks` 个 tick 里，让世界从宽松状态线性过渡到目标参数：浆果再生 × `ramp_berry_multiplier`（默认 3）→ 1，基础代谢 × `ramp_metabolism_multiplier`（默认 0.5）→ 1，温差幅度 × `ramp_temperature_multiplier`（默认 0.2）→ 1，毒素含量在爬坡期间为 0（毒性切换只在爬坡结束后生效）。这里只调整环境条件，不设计行为。
 
 ---
 
@@ -736,26 +761,24 @@ fork(snapshot, patches, n_ticks) → (treated_run, control_run)
 
 ```
 oneiros/
-  PRINCIPLES.md
-  SANDBOX.md
-  ARCHITECTURES.md
-  EMOTIONS.md
-  RESULTS.md
-  sandbox/
-    core/       state.py  refs.py  scheduler.py  rng.py  hashing.py  accounting.py
-    fields/     registry.py  temperature.py  light.py  odor.py  sound.py
-    world/      physics.py  vision.py  bushes.py  carcass.py  toxin_schedule.py  neutral.py
-    body/       body.py  nutrition.py  sensors.py  motor.py  interactions.py  thermo.py  growth.py  reproduction.py  death.py
-    brain/      plastic_rnn.py  slice_transformer.py  queue_rnn.py  segment_memory.py  mtrnn.py  four_layer.py  genome.py  mutation.py
-    observe/    observers.py  schema.py  writers.py  snapshot.py
-    intervene/  fork.py  patches.py
-    config.py   run.py
-  configs/      world/  arm/  exp/  calibration/
-  prereg/
-  analysis/     只读日志，不被 sandbox 导入
-  results/
-  tests/
-  runs/         不入库
+  README.md  RESULTS.md  pyproject.toml  uv.lock  .python-version
+  docs/               PRINCIPLES.md  SANDBOX.md  ARCHITECTURES.md  EMOTIONS.md
+  configs/
+    world/            default.toml
+    arms/ exp/ calibration/   （M1 起）
+  prereg/             实验预注册（编号文档）
+  runs/               运行输出，不入库
+  scripts/
+  tests/              test_*.py，对应 §13 清单
+  src/life_sandbox/
+    config.py  cli.py
+    core/             struct.py  state.py  components.py  masks.py  rng.py  hashing.py
+                      events.py  ledger.py  genome.py  step.py  accounting.py
+    core/systems/     环境、感知、思维、学习、运动、交互、代谢、繁殖、死亡（每系统一个文件）
+    world/            init.py  constants.py  fields.py  vision.py  physics.py
+    brain/            base.py  genome.py（候选大脑 B1–B5 在 M2 起加入）
+    observe/          观测器与日志（M2）
+    intervene/        快照分叉与 patch（M2）
 ```
 
 ---
@@ -770,6 +793,7 @@ oneiros/
 6. **一个提交只做一件事。** 结果提交只包含 `results/` 和 `RESULTS.md`。
 7. **常驻文档只有五份：** PRINCIPLES、SANDBOX、ARCHITECTURES、EMOTIONS、RESULTS。其他文档按编号放进 `prereg/` 和 `results/`。EMOTIONS 只用于分析，任何代码都不得引用它的内容。
 8. **先通过里程碑验收，再跑确认性实验。**
+9. **宽度由布局推导。** 基因组宽度、快权重宽度等数组尺寸从脑布局推出（§6.3），不写死在配置里；D 或 H 变化时不得手改两个数。
 
 ---
 

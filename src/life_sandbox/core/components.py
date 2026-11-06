@@ -36,6 +36,11 @@ PLANT, ANIMAL, TOXIN = range(3)
 N_NUTRIENTS: int = 3
 FLESH_COMP: tuple[float, float, float] = (0.3, 0.7, 0.0)
 
+# Pain bundle channels (§5.6): nine sources mixed into four shared channels.
+# The width is a physical property of the afferent bundle, independent of the
+# odour channel count even though both are four today.
+N_PAIN_CHANNELS: int = 4
+
 # Pain bundle sources (§5.6).  These are observer-side names only: the agent
 # receives four shared channels and never sees which source is which.
 PAIN_SOURCES: tuple[str, ...] = (
@@ -50,6 +55,31 @@ PAIN_SOURCES: tuple[str, ...] = (
     "sleepiness",
 )
 N_PAIN_SOURCES: int = len(PAIN_SOURCES)
+
+# Nutrient ledger categories (SANDBOX.md §3.5).  Inflow and outflow are split by
+# reason so a segment report can attribute where mass crossed the book boundary.
+INFLOW_BITES: int = 0
+INFLOW_RESEED: int = 1
+N_INFLOW_CATEGORIES: int = 2
+INFLOW_NAMES: tuple[str, ...] = ("bites", "reseed")
+
+OUTFLOW_METABOLISM: int = 0
+OUTFLOW_EXCRETION: int = 1
+OUTFLOW_OVERFLOW: int = 2
+OUTFLOW_TOXIN_LOAD: int = 3
+OUTFLOW_BIRTH_LOSS: int = 4
+OUTFLOW_DEATH_LOSS: int = 5
+OUTFLOW_DECOMPOSITION: int = 6
+N_OUTFLOW_CATEGORIES: int = 7
+OUTFLOW_NAMES: tuple[str, ...] = (
+    "metabolism",
+    "excretion",
+    "overflow",
+    "toxin_load",
+    "birth_loss",
+    "death_loss",
+    "decomposition",
+)
 
 # Empty reference sentinel.
 NO_REF: int = -1
@@ -304,16 +334,17 @@ class Genome:
 class BrainState:
     """Default brain state (SANDBOX.md §6.1).
 
-    h: recurrent state; s_hat: previous prediction; w_fast: plastic weights;
-    last_pre/last_post: pre and post activities of the previous step, used by
-    the Hebbian rule.
+    h: recurrent state; s_hat: prediction made for the next slice; w_fast:
+    plastic weights; e: prediction error e_t = s_t - s_hat_t computed once by
+    think and reused bit-exactly by learn; h_prev: h_(t-1), the pre activity of
+    W_rec and of the prediction delta rule.
     """
 
     h: jax.Array
     s_hat: jax.Array
     w_fast: jax.Array
-    last_pre: jax.Array
-    last_post: jax.Array
+    e: jax.Array
+    h_prev: jax.Array
 
     @staticmethod
     def zeros(n: int, h: int, slice_dim: int, plastic_dim: int) -> "BrainState":
@@ -321,19 +352,27 @@ class BrainState:
             h=f32(n, h),
             s_hat=f32(n, slice_dim),
             w_fast=f32(n, plastic_dim),
-            last_pre=f32(n, slice_dim),
-            last_post=f32(n, h),
+            e=f32(n, slice_dim),
+            h_prev=f32(n, h),
         )
 
 
 @struct
 @dataclass(frozen=True)
 class Motor:
+    """Intended outputs and the effective controls after motion noise (§5.3).
+
+    last_out keeps the raw brain outputs; u_eff = [u_acc', u_turn'] is what
+    motion actually applied (noise added, clipped).  Other systems (metabolism,
+    interaction) read u_eff instead of re-deriving the noise from the motion key.
+    """
+
     last_out: jax.Array
+    u_eff: jax.Array
 
     @staticmethod
     def zeros(n: int) -> "Motor":
-        return Motor(last_out=f32(n, N_OUTPUTS))
+        return Motor(last_out=f32(n, N_OUTPUTS), u_eff=f32(n, 2))
 
 
 @struct
@@ -421,6 +460,34 @@ class NeutralArena:
 
 @struct
 @dataclass(frozen=True)
+class Ledger:
+    """Per-tick nutrient flow draft area (SANDBOX.md §3.5).
+
+    step clears it at the start of every tick and systems accumulate the flows
+    where they happen; step returns it as a per-tick scan output, so the host
+    sums in float64 and nothing accumulates across ticks inside the state.  It
+    is a global resource, never a sensor: the agent cannot see it.
+    """
+
+    inflow: jax.Array
+    outflow: jax.Array
+    transfer_from: jax.Array
+    transfer_to: jax.Array
+    digested: jax.Array
+
+    @staticmethod
+    def zeros() -> "Ledger":
+        return Ledger(
+            inflow=f32(N_INFLOW_CATEGORIES, N_NUTRIENTS),
+            outflow=f32(N_OUTFLOW_CATEGORIES, N_NUTRIENTS),
+            transfer_from=f32(N_NUTRIENTS),
+            transfer_to=f32(N_NUTRIENTS),
+            digested=f32(N_NUTRIENTS),
+        )
+
+
+@struct
+@dataclass(frozen=True)
 class Entities:
     """All prototypes of one world, each in its own fixed-capacity arena (§3.1)."""
 
@@ -431,6 +498,13 @@ class Entities:
 
     @staticmethod
     def empty(cfg) -> "Entities":
+        # Local import: brain.genome imports this module, so a module-level
+        # import here would be a cycle.  Genome and fast-weight widths are
+        # derived from the selected brain layout (SANDBOX.md §6.3), never from
+        # hand-written config numbers.
+        from life_sandbox.brain.genome import layout as brain_layout
+
+        lay = brain_layout(cfg)
         n_creature = cfg.capacities.creature
         n_bush = cfg.capacities.bush
         n_carcass = cfg.capacities.carcass
@@ -448,13 +522,8 @@ class Entities:
                 damage=Damage.zeros(n_creature),
                 grip=Grip.zeros(n_creature),
                 contact=Contact.zeros(n_creature),
-                genome=Genome.zeros(n_creature, cfg.brain.genome_dim),
-                brain=BrainState.zeros(
-                    n_creature,
-                    cfg.brain.h,
-                    cfg.sensors.slice_dim,
-                    cfg.brain.plastic_dim,
-                ),
+                genome=Genome.zeros(n_creature, lay.total),
+                brain=BrainState.zeros(n_creature, cfg.brain.h, lay.d, lay.plastic_dim),
                 motor=Motor.zeros(n_creature),
                 focal=Focal.zeros(n_creature),
             ),

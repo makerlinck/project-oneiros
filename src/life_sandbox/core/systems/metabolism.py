@@ -28,8 +28,12 @@ Documented decisions (SANDBOX.md is silent):
 - Toxin absorbed above N_cap is overflow (an accounting outflow), not a return
   to X; only the unabsorbed fraction (1 - eps_T)*delta_T reaches X (§5.1
   wording: "unabsorbed T becomes X", overflow is recorded separately).
-- Integrity is repaired only when sum(N) > 0.5, at 0.002 per tick, and the
-  same 0.002 is added to c_tot and split by rho (§5.2).
+- Integrity is repaired only while I < 1 and sum(N) > 0.5; the repaired amount
+  is min(0.002, 1-I) and exactly that amount enters c_tot, split by rho
+  (§5.2, §5.3 "cost of repair if there was repair this tick").
+- The motion part of c_tot uses the effective controls Motor.u_eff = u' (the
+  noise-added, clipped outputs the motion system applied, §5.3), not the raw
+  intended outputs; the bite surcharge uses the intended u_bite.
 - Growth is all-or-nothing per tick: if any component of 0.1*delta_m*c_flesh
   is unavailable, the tick adds no mass.
 - "inside a bush" for shading is the centre within the bush radius; temperature
@@ -45,6 +49,7 @@ import jax.numpy as jnp
 from life_sandbox.config import Config
 from life_sandbox.core import components as C
 from life_sandbox.core import events, masks
+from life_sandbox.core.ledger import add_digested, add_outflow
 from life_sandbox.core.state import WorldState
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems import motor
@@ -64,7 +69,9 @@ TISSUE_PER_MASS: float = 0.1
 REPAIR_RATE: float = 0.002
 REPAIR_MIN_RESERVES: float = 0.5
 BASE_METABOLISM: float = 0.002
-AGING_RATE: float = 3.0
+# Base-demand knob term: 0.002*(1 + 3*k^2) (§5.3).  The 3 is the knob energy
+# coefficient, not an ageing rate; the ageing bonus is derived from a_sen.
+KNOB_ENERGY_COEFF: float = 3.0
 INJURY_DECAY: float = 0.7
 INJURY_GAIN: float = 10.0
 
@@ -111,7 +118,7 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     p = 0.9 * body.p + 0.1 * knob
     phi_hb = body.phi_hb + 2.0 * jnp.pi * (1.0 + 2.0 * p) / 20.0
     age = body.age + alive.astype(jnp.int32)
-    aging = jnp.maximum(
+    aging_bonus = jnp.maximum(
         jnp.asarray(0.0, jnp.float32),
         (age.astype(jnp.float32) - A_SEN) / jnp.asarray(A_SEN, jnp.float32),
     )
@@ -131,21 +138,32 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     # 4. metabolic demand (§5.3).
     m_held = masks.held_mass(entities)
     mass = creature.shape.mass
+    # Motion cost uses the effective controls u' the motion system applied
+    # (§5.3: "0.002*|u'_acc| ..."), not the raw intended outputs.
+    u_eff = creature.motor.u_eff
     movement = (
         BASE_METABOLISM
-        * jnp.abs(last[:, C.OUT_ACC])
+        * jnp.abs(u_eff[:, 0])
         * (1.0 + knob)
         * (mass + m_held)
-        + 0.0005 * jnp.abs(last[:, C.OUT_TURN])
+        + 0.0005 * jnp.abs(u_eff[:, 1])
         + 0.002 * jnp.maximum(last[:, C.OUT_BITE], 0.0)
     ) * awake
     base = (
         BASE_METABOLISM
-        * (1.0 + AGING_RATE * knob * knob)
-        * (1.0 + aging)
+        * (1.0 + KNOB_ENERGY_COEFF * knob * knob)
+        * (1.0 + aging_bonus)
         * jnp.where(asleep, 0.5, 1.0)
     )
-    repair = jnp.where(jnp.sum(reserves, axis=1) > REPAIR_MIN_RESERVES, REPAIR_RATE, 0.0)
+    # Repair only happens while integrity is below 1 and reserves can pay for
+    # it; the demand charges exactly the amount repaired this tick (§5.3).
+    repair = jnp.where(
+        alive
+        & (body.I < 1.0)
+        & (jnp.sum(reserves, axis=1) > REPAIR_MIN_RESERVES),
+        jnp.minimum(REPAIR_RATE, 1.0 - body.I),
+        0.0,
+    )
     demand = base + movement + repair
     required = diet * demand[:, None]
     deficit = jnp.maximum(required - reserves, 0.0)
@@ -194,7 +212,7 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     damage = _book_damage(damage, cold, events.cause_code("cold"))
     integrity = jnp.clip(
         body.I
-        + jnp.where(alive, repair, 0.0)
+        + repair
         - deficiency
         - toxin_damage
         - heat
@@ -231,4 +249,28 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     )
     shape = update(creature.shape, mass=mass, radius=radius)
     creature = update(creature, body=body, shape=shape, damage=damage, pain=pain)
-    return update(state, entities=update(entities, creature=creature)), events.empty(cfg)
+
+    # ---------------------------------------------------------- §3.5 ledger
+    # Digestion G->N is an internal transfer (diagnostic only).  Only alive
+    # slots contribute: dead slots keep stale components until reuse.
+    alive_mask = alive[:, None]
+    digested = jnp.sum(jnp.where(alive_mask, delta, 0.0), axis=0)
+    consumed = jnp.sum(jnp.where(alive_mask, required - deficit, 0.0), axis=0)
+    unabsorbed = (1.0 - conversion) * delta
+    excretion = jnp.sum(jnp.where(alive_mask, unabsorbed, 0.0), axis=0) * jnp.asarray(
+        [1.0, 1.0, 0.0], jnp.float32
+    )
+    toxin_load = jnp.zeros(C.N_NUTRIENTS, jnp.float32).at[C.TOXIN].set(
+        jnp.sum(jnp.where(alive, unabsorbed[:, C.TOXIN], 0.0))
+    )
+    overflow_flow = jnp.sum(jnp.where(alive_mask, overflow, 0.0), axis=0)
+    ledger = state.ledger
+    ledger = add_digested(ledger, digested)
+    ledger = add_outflow(ledger, C.OUTFLOW_METABOLISM, consumed)
+    ledger = add_outflow(ledger, C.OUTFLOW_EXCRETION, excretion)
+    ledger = add_outflow(ledger, C.OUTFLOW_OVERFLOW, overflow_flow)
+    ledger = add_outflow(ledger, C.OUTFLOW_TOXIN_LOAD, toxin_load)
+    return (
+        update(state, entities=update(entities, creature=creature), ledger=ledger),
+        events.empty(cfg),
+    )

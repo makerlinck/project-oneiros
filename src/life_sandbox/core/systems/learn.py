@@ -6,7 +6,7 @@ Only cfg.brain.kind == "plastic_rnn" learns; the M0 bootstrap path has no
 brain state to update (SANDBOX 9), so it returns the state unchanged.
 
 Pipeline for every slot (all inputs are the values think just wrote):
-  * e_t = BrainState.last_pre (the e_t think used, stored verbatim);
+  * e_t = BrainState.e (the e_t think used, stored verbatim);
   * prediction delta rule, capability switch cfg.learning.prediction:
         W_pred^fast += eta_p * e_t (outer) h_(t-1)
     (with the switch off, think has already silenced W_err and zeroed s_hat,
@@ -14,7 +14,7 @@ Pipeline for every slot (all inputs are the values think just wrote):
   * modulated Hebbian rule for W_in, W_rec, W_out, switch
     cfg.learning.plasticity:
         W_in : pre s_t = state.slice,               post h_t = BrainState.h
-        W_rec: pre h_(t-1) = BrainState.last_post,  post h_t
+        W_rec: pre h_(t-1) = BrainState.h_prev,     post h_t
         W_out: pre h_t,                             post out_t = Motor.last_out
     eta_j/lambda_j are per post-synaptic unit; cfg.learning.eta_granularity
     decides whether they are used per unit, per group or shared
@@ -62,8 +62,8 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     brain = creature.brain
     s = state.slice
     h = brain.h
-    h_prev = brain.last_post
-    e = brain.last_pre
+    h_prev = brain.h_prev
+    e = brain.e
     out = creature.motor.last_out
 
     if cfg.learning.prediction:

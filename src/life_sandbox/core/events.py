@@ -32,6 +32,9 @@ EVENT_KINDS: tuple[str, ...] = (
     "sleep_start",
     "sleep_end",
     "recall",
+    # Parent was mature and eligible but the per-tick birth budget was full;
+    # it is deferred to a later tick (§5.5, C5).
+    "birth_defer",
 )
 
 DEATH_CAUSES: tuple[str, ...] = (

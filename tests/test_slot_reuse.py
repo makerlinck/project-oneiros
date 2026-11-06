@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
+import pytest
 
 from life_sandbox.core import components as C
 from life_sandbox.core import masks
@@ -31,6 +32,12 @@ def test_allocate_uids_is_sequential_and_monotonic():
     uids, counter = masks.allocate_uids(counter, 2)
     assert [int(u) for u in uids] == [13, 14]
     assert int(counter) == 15
+
+
+def test_uid_counter_guard_stops_before_int32_wrap():
+    masks.ensure_uid_headroom(10)
+    with pytest.raises(RuntimeError, match="uid counter"):
+        masks.ensure_uid_headroom(masks.UID_MAX - 1)
 
 
 def test_slot_reuse_invalidates_old_reference(tiny_cfg):

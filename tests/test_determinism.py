@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from life_sandbox.core.hashing import state_hash
-from life_sandbox.core.step import step
+from life_sandbox.core.step import run, step
 from life_sandbox.world.init import initial_state
 
 
@@ -28,6 +28,21 @@ def test_tick_advances_and_hash_changes(tiny_cfg):
     state, _ = step(state, tiny_cfg)
     assert int(state.tick) == 1
     assert state_hash(state) != before
+
+
+def test_segment_length_does_not_change_results(tiny_cfg):
+    """K is a throughput knob only: the same seed and config must be bit-identical for any K."""
+    state = initial_state(tiny_cfg)
+    results = [
+        run(state, tiny_cfg, 6, compile=True, segment=k) for k in (1, 2, 3, 6)
+    ]
+    hashes = {state_hash(result.state) for result in results}
+    assert len(hashes) == 1
+    first = results[0]
+    for result in results[1:]:
+        assert result.counts == first.counts
+        assert (result.inflow == first.inflow).all()
+        assert (result.outflow == first.outflow).all()
 
 
 def test_different_seeds_diverge(tiny_cfg):

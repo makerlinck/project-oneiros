@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import numpy as np
+
 from life_sandbox.config import Config, WorldConfig
+from life_sandbox.core import components as C
 from life_sandbox.core import events
+from life_sandbox.core.hashing import state_hash
 
 
 def _small_cfg():
@@ -38,6 +42,35 @@ def test_concat_appends_b_before_capacity():
     assert int(merged.count) == 2
     assert int(merged.uid[0]) == 0
     assert int(merged.uid[1]) == 1
+
+
+def test_scan_path_carries_events_not_only_counts(tiny_cfg):
+    """The compiled production path must expose the same events as eager (problem 3)."""
+    from life_sandbox.core.step import run
+    from life_sandbox.world.init import initial_state
+
+    state = initial_state(tiny_cfg)
+    eager = run(state, tiny_cfg, 3, compile=False, collect_events=True)
+    compiled = run(state, tiny_cfg, 3, compile=True, collect_events=True)
+    assert eager.counts == compiled.counts
+    assert eager.event_count() == compiled.event_count()
+    assert eager.event_count() == sum(eager.counts.values())
+    for name in ("kind", "uid", "x", "y"):
+        assert eager.events[name].shape == compiled.events[name].shape
+        assert np.array_equal(eager.events[name], compiled.events[name])
+    assert eager.inflow.shape == (C.N_INFLOW_CATEGORIES, C.N_NUTRIENTS)
+    assert eager.outflow.shape == (C.N_OUTFLOW_CATEGORIES, C.N_NUTRIENTS)
+    # Events are exact; the float32 ledger can differ by ULPs between the eager
+    # reference and the fused jit path (XLA fusion reorders float32 ops), so the
+    # ledger comparison follows the §3.5 relative tolerance instead.
+    assert np.allclose(eager.inflow, compiled.inflow, rtol=1e-6, atol=1e-9)
+    assert np.allclose(eager.outflow, compiled.outflow, rtol=1e-6, atol=1e-9)
+    assert np.allclose(eager.transfer_from, compiled.transfer_from, rtol=1e-6, atol=1e-9)
+    assert np.allclose(eager.transfer_to, compiled.transfer_to, rtol=1e-6, atol=1e-9)
+    # The compiled production path itself must be bit-reproducible.
+    again = run(state, tiny_cfg, 3, compile=True, collect_events=True)
+    assert state_hash(again.state) == state_hash(compiled.state)
+    assert again.counts == compiled.counts
 
 
 def test_summary_counts_by_kind():

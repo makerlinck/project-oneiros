@@ -105,6 +105,10 @@ def test_acceleration_drag_analytic():
     pos = out.entities.creature.transform.pos[0]
     assert float(pos[0]) == pytest.approx(10.0 + 0.045, abs=1e-6)
     assert float(pos[1]) == pytest.approx(10.0, abs=1e-6)
+    # Motor.u_eff exposes the effective controls u' used by body/interaction.
+    assert jnp.allclose(out.entities.creature.motor.u_eff[0], jnp.asarray([1.0, 0.0]))
+    # Motion is not an external nutrient flow: the ledger stays empty (§3.5).
+    assert jnp.allclose(out.ledger.inflow, 0.0) and jnp.allclose(out.ledger.outflow, 0.0)
 
 
 def test_drag_without_thrust():
@@ -132,6 +136,7 @@ def test_turn_and_wrap():
         0.3 * (0.3 + 0.7 * 0.5), abs=1e-6
     )
     assert float(out.entities.creature.transform.theta[0]) == pytest.approx(0.195, abs=1e-6)
+    assert jnp.allclose(out.entities.creature.motor.u_eff[0], jnp.asarray([0.0, 1.0]))
     assert float(out.entities.creature.transform.pos[0, 0]) == pytest.approx(10.0, abs=1e-7)
 
     state = creature_state(cfg, theta=3.1, last=outputs(turn=1.0))
@@ -204,8 +209,34 @@ def test_asleep_decays_speed_and_ignores_outputs():
     out, _ = motor.apply(state, cfg)
     assert float(out.entities.creature.transform.v[0]) == pytest.approx(0.36, abs=1e-6)
     assert float(out.entities.creature.transform.omega[0]) == pytest.approx(0.0, abs=1e-7)
+    assert jnp.allclose(out.entities.creature.motor.u_eff[0], jnp.asarray([0.0, 0.0]))
     pos = out.entities.creature.transform.pos[0]
     assert float(pos[0]) == pytest.approx(10.0 + 0.36, abs=1e-6)
+
+
+def test_motor_writes_clipped_effective_controls():
+    """u_eff = clip(u + noise, -1, 1), zero for asleep and dead slots (§5.3)."""
+    cfg = small_cfg()
+    last = outputs(acc=3.0, turn=-3.0)  # out-of-range intended values are clipped
+    state = creature_state(cfg, last=last)
+    out, _ = motor.apply(state, cfg)
+    assert jnp.allclose(out.entities.creature.motor.u_eff[0], jnp.asarray([1.0, -1.0]))
+    intended = out.entities.creature.motor.last_out[0]
+    assert float(intended[C.OUT_ACC]) == pytest.approx(3.0, abs=1e-6)
+    assert float(intended[C.OUT_TURN]) == pytest.approx(-3.0, abs=1e-6)
+
+    asleep = creature_state(cfg, asleep=True, last=last)
+    out_asleep, _ = motor.apply(asleep, cfg)
+    assert jnp.allclose(out_asleep.entities.creature.motor.u_eff[0], jnp.asarray([0.0, 0.0]))
+
+    dead_state = creature_state(cfg, last=last)
+    cre = dead_state.entities.creature
+    dead_state = update(
+        dead_state,
+        entities=update(dead_state.entities, creature=update(cre, alive=jnp.zeros((N,), jnp.bool_))),
+    )
+    out_dead, _ = motor.apply(dead_state, cfg)
+    assert jnp.allclose(out_dead.entities.creature.motor.u_eff[0], jnp.asarray([0.0, 0.0]))
 
 
 def test_noise_is_deterministic_and_bounded():

@@ -12,7 +12,12 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
-from life_sandbox.core.components import Entities
+from life_sandbox.core.components import (
+    N_PAIN_CHANNELS,
+    N_PAIN_SOURCES,
+    Entities,
+    Ledger,
+)
 from life_sandbox.core.struct import struct
 from life_sandbox.world.constants import INITIAL_COMP
 
@@ -36,6 +41,7 @@ class WorldState:
     comp: jax.Array
     pain_weights: jax.Array
     slice: jax.Array
+    ledger: Ledger
 
 
 def empty(cfg, key: jax.Array | None = None) -> WorldState:
@@ -49,7 +55,8 @@ def empty(cfg, key: jax.Array | None = None) -> WorldState:
         entities=Entities.empty(cfg),
         fields=WorldFields(odor=jnp.zeros((*grid, odor_channels), dtype=jnp.float32)),
         comp=jnp.asarray(INITIAL_COMP, dtype=jnp.float32),
-        pain_weights=jnp.zeros((9, odor_channels), dtype=jnp.float32),
+        pain_weights=jnp.zeros((N_PAIN_SOURCES, N_PAIN_CHANNELS), dtype=jnp.float32),
+        ledger=Ledger.zeros(),
         slice=jnp.zeros(
             (cfg.capacities.creature, cfg.sensors.slice_dim + (5 if cfg.learning.readable_leak else 0)),
             dtype=jnp.float32,

@@ -80,8 +80,8 @@ def test_think_bootstrap_writes_only_motor(tiny_cfg):
     assert bool(jnp.all(after.entities.creature.brain.h == 0))
     assert bool(jnp.all(after.entities.creature.brain.s_hat == 0))
     assert bool(jnp.all(after.entities.creature.brain.w_fast == 0))
-    assert bool(jnp.all(after.entities.creature.brain.last_pre == 0))
-    assert bool(jnp.all(after.entities.creature.brain.last_post == 0))
+    assert bool(jnp.all(after.entities.creature.brain.e == 0))
+    assert bool(jnp.all(after.entities.creature.brain.h_prev == 0))
 
 
 def test_bootstrap_does_not_learn(tiny_cfg):

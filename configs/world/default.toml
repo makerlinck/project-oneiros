@@ -3,6 +3,7 @@
 [run]
 seed = 0
 ticks = 200
+segment_ticks = 64    # 每段 lax.scan 的 tick 数；K 只影响吞吐，不影响结果
 
 [world]
 width = 64.0          # §4.1 平面 64 x 64 单位
@@ -13,7 +14,10 @@ odor_diffusion = 0.2  # §4.3 D = 0.2
 odor_decay = 0.02     # §4.3 delta = 0.02
 odor_scale = 1000000  # 沉积用定点整数（SANDBOX.md §2 确定性）
 founders = 64         # 创始个体数（M1 标定）
-ramp_ticks = 0        # §9 起步爬坡
+ramp_ticks = 0        # §9 起步爬坡：0 表示关闭；M1 标定取值
+ramp_berry_multiplier = 3.0       # 爬坡起点：浆果再生倍率
+ramp_metabolism_multiplier = 0.5  # 爬坡起点：基础代谢倍率
+ramp_temperature_multiplier = 0.2 # 爬坡起点：温差幅度倍率
 event_capacity = 2048 # §3.3 定长带掩码事件缓冲
 l_ticks = 500.0       # L，M1 标定前的占位值
 c_switch = 1.0        # §4.4 T_switch = c_switch * L
@@ -41,8 +45,7 @@ sound_channels = 0    # 第 6 阶段追加 2 x 2
 kind = "bootstrap"  # M0：随机策略驱动身体（§9）；M2 起为 "plastic_rnn"（§6.4）
 h = 32
 modulators = 4
-genome_dim = 8400    # §6.5 估计 ~8.3k；精确 B0 块 8354（含共享头）
-plastic_dim = 5696
+# 基因组宽度与快权重宽度由 brain.genome.layout 从 H/D/M/N_OUT 推出，不在此配置。
 motion_noise = 0.05
 
 [learning]

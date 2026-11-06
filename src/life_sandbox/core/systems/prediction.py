@@ -9,7 +9,7 @@ s_hat_t is the prediction of the current slice produced on the previous tick
 (SANDBOX.md 3.3: "think gives s_hat_(t+1)", "learn uses e_t = s_t - s_hat_t").
 The error is the only architectural assumption (PRINCIPLES.md 3) and it also
 feeds the hidden units through W_err, so think and learn must use bitwise the
-same e_t -- think stores it in BrainState.last_pre and learn reuses it.
+same e_t -- think stores it in BrainState.e and learn reuses it.
 
 The delta rule has no explicit clip in SANDBOX.md 6.1.  Documented local choice:
 W_pred^fast is clipped to [-1, 1] like every other fast weight, so a long run

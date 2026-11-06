@@ -35,6 +35,19 @@ def test_unknown_keys_are_rejected():
         Config.from_dict({"nope": 1})
 
 
+def test_readable_leak_is_rejected_until_m3():
+    cfg = Config.default().replaced(
+        learning=Config.default().learning.__class__(readable_leak=True)
+    )
+    with pytest.raises(ValueError, match="readable_leak"):
+        cfg.validate()
+
+
+def test_brain_widths_are_not_configurable():
+    assert not hasattr(Config.default().brain, "genome_dim")
+    assert not hasattr(Config.default().brain, "plastic_dim")
+
+
 def test_validation_catches_bad_slice_and_granularity():
     bad = Config.default().replaced(sensors=Sensors(sound_channels=1))
     with pytest.raises(ValueError, match="slice dimension"):

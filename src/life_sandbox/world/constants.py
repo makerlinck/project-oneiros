@@ -48,13 +48,22 @@ BERRY_RGB: tuple[tuple[float, float, float], ...] = (
     (0.60, 0.40, 0.20),
 )
 
-# Founder body defaults.  Founders start as adults (mu = 1, mass = 1) with half
-# reserves and half tissue; these are calibration values for M1.
+# Founder body defaults (SANDBOX.md §5.2, §5.5).  Founders start as adults
+# (mu = 1); mass and tissue follow from the growth rule instead of being set by
+# a separate constant:
+#   newborn: mass 0.3, B = 0.03*c_flesh
+#   growth: 每 delta_m 质量支付 0.1*delta_m*c_flesh
+#   adult:   mass 1.0, B = (0.03 + 0.1*(1.0 - 0.3))*c_flesh = 0.10*c_flesh
 FOUNDER_RADIUS: float = 0.5
-FOUNDER_MASS: float = 1.0
 FOUNDER_INTEGRITY: float = 1.0
-FOUNDER_RESERVE_FRACTION: float = 0.5
-FOUNDER_TISSUE_FRACTION: float = 0.5
+FOUNDER_RESERVE_FRACTION: float = 0.5   # M1 scans 0.3–0.5
+CHILD_MASS: float = 0.3
+CHILD_TISSUE_FRACTION: float = 0.03
+GROWTH_TISSUE_PER_MASS: float = 0.1
+ADULT_MASS: float = 1.0
+ADULT_TISSUE_FRACTION: float = CHILD_TISSUE_FRACTION + GROWTH_TISSUE_PER_MASS * (
+    ADULT_MASS - CHILD_MASS
+)
 
 # Neutral objects (§4.5).
 NEUTRAL_RADIUS: float = 0.4

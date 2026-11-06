@@ -1,7 +1,8 @@
 """environment system tests (SANDBOX.md §4.2, §4.4, §4.5, §13 §12.5).
 
-Covers berry regeneration, carcass rot and removal, the toxin schedule (period,
-composition, conditional event) and the scripted wander of neutral objects.
+Covers berry regeneration, bush appearance, carcass rot and removal (including
+the ledger bookkeeping of §3.5), the toxin schedule (period, composition,
+conditional event) and the scripted wander of neutral objects.
 """
 
 from __future__ import annotations
@@ -14,11 +15,12 @@ import numpy as np
 import pytest
 
 from life_sandbox.config import Capacities, Config, RunConfig, WorldConfig
+from life_sandbox.core import components as C
 from life_sandbox.core import events, rng
 from life_sandbox.core.state import empty
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems import environment
-from life_sandbox.world.constants import INITIAL_COMP
+from life_sandbox.world.constants import BERRY_RGB, BUSH_GREEN, INITIAL_COMP
 
 BASE = np.asarray(INITIAL_COMP, np.float64)
 
@@ -39,16 +41,29 @@ def state_of(cfg: Config):
     return empty(cfg, rng.world_key(13))
 
 
+def _full(values, capacity, dtype, fill):
+    """Pad or truncate a per-slot vector to the arena capacity."""
+    values = jnp.asarray(values, dtype)
+    if values.shape[0] >= capacity:
+        return values[:capacity]
+    tail = jnp.full((capacity - values.shape[0],), fill, dtype)
+    return jnp.concatenate([values, tail])
+
+
 def set_stock(state, stocks, kinds=None, alive=None):
     arena = state.entities.bush
+    capacity = arena.alive.shape[0]
+    stock = _full(stocks, capacity, jnp.float32, 0.0)
+    kind = arena.edible.kind if kinds is None else _full(kinds, capacity, jnp.int32, 0)
+    if alive is None:
+        # Slots given a stock are made alive by default; the rest stay dead.
+        count = len(stocks)
+        alive = [slot < count for slot in range(capacity)]
+    live = _full(alive, capacity, jnp.bool_, False)
     arena = update(
         arena,
-        alive=arena.alive if alive is None else jnp.asarray(alive, jnp.bool_),
-        edible=update(
-            arena.edible,
-            stock=jnp.asarray(stocks, jnp.float32),
-            kind=arena.edible.kind if kinds is None else jnp.asarray(kinds, jnp.int32),
-        ),
+        alive=live,
+        edible=update(arena.edible, stock=stock, kind=kind),
     )
     return update(state, entities=update(state.entities, bush=arena))
 
@@ -261,12 +276,136 @@ def test_environment_is_deterministic():
     assert int(first_buffer.count) == int(second_buffer.count)
 
 
+def test_carcass_rot_records_an_internal_transfer():
+    cfg = make_cfg()
+    state = set_carcass(state_of(cfg), 0, [0.5, 0.4, 0.1], age=0)
+    state = set_carcass(state, 1, [0.2, 0.0, 0.3], age=0)
+    assert np.allclose(np.asarray(state.ledger.transfer_from), 0.0)
+    out, _ = environment.apply(state, cfg)
+    ledger = out.ledger
+
+    expected_from = np.asarray([0.005 * (0.5 + 0.2), 0.005 * 0.4, 0.0])
+    expected_to = np.asarray([0.0, 0.0, 0.005 * (0.5 + 0.2 + 0.4)])
+    assert np.asarray(ledger.transfer_from).tolist() == pytest.approx(
+        expected_from.tolist(), abs=1e-7
+    )
+    assert np.asarray(ledger.transfer_to).tolist() == pytest.approx(
+        expected_to.tolist(), abs=1e-7
+    )
+    # An internal conversion conserves mass and is not an inflow/outflow (§3.5).
+    assert float(np.asarray(ledger.transfer_from).sum()) == pytest.approx(
+        float(np.asarray(ledger.transfer_to).sum()), abs=1e-7
+    )
+    assert np.allclose(np.asarray(ledger.inflow), 0.0, atol=1e-7)
+    assert np.allclose(np.asarray(ledger.outflow), 0.0, atol=1e-7)
+
+
+def test_carcass_removal_books_its_remaining_n_as_decomposition():
+    cfg = make_cfg()
+    state = set_carcass(state_of(cfg), 0, [0.5, 0.4, 0.1], age=600)  # removed this tick
+    state = set_carcass(state, 1, [1.0, 0.0, 0.0], age=0)  # stays alive
+    out, _ = environment.apply(state, cfg)
+
+    assert bool(out.entities.carcass.alive[0]) is False
+    assert bool(out.entities.carcass.alive[1]) is True
+    retained = np.asarray(out.entities.carcass.edible.n[0])
+    decomposition = np.asarray(out.ledger.outflow[C.OUTFLOW_DECOMPOSITION])
+    assert decomposition.tolist() == pytest.approx(retained.tolist(), abs=1e-7)
+    assert float(decomposition.sum()) == pytest.approx(1.0, abs=1e-6)
+    # The dead slot keeps its n: the ledger owns the flow, the slot keeps the data.
+    assert retained.tolist() == pytest.approx([0.4975, 0.398, 0.1045], abs=1e-7)
+    # No other outflow category is touched, and the same tick's rot transfer is
+    # still recorded for both living carcasses (the leaving one included).
+    other = np.delete(np.asarray(out.ledger.outflow), C.OUTFLOW_DECOMPOSITION, axis=0)
+    assert np.allclose(other, 0.0, atol=1e-7)
+    assert float(np.asarray(out.ledger.transfer_from).sum()) == pytest.approx(0.0095, abs=1e-7)
+
+
+def test_empty_carcass_removal_books_near_zero():
+    cfg = make_cfg()
+    state = set_carcass(state_of(cfg), 0, [0.0, 0.0, 0.0], age=5)
+    out, _ = environment.apply(state, cfg)
+    assert bool(out.entities.carcass.alive[0]) is False
+    assert np.allclose(
+        np.asarray(out.ledger.outflow[C.OUTFLOW_DECOMPOSITION]), 0.0, atol=1e-7
+    )
+
+
+def test_already_dead_carcass_books_nothing():
+    cfg = make_cfg()
+    state = set_carcass(state_of(cfg), 0, [0.5, 0.0, 0.0], age=700, alive=False)
+    out, _ = environment.apply(state, cfg)
+    assert np.allclose(np.asarray(out.ledger.transfer_from), 0.0, atol=1e-7)
+    assert np.allclose(np.asarray(out.ledger.outflow), 0.0, atol=1e-7)
+
+
+def test_bush_colour_mixes_green_with_the_species_berry_colour():
+    cfg = make_cfg()
+    state = set_stock(state_of(cfg), [0.0, 0.5, 1.0], kinds=[0, 1, 2])
+    arena = environment.bush_appearance(state.entities.bush)
+    rgb = np.asarray(arena.look.rgb)
+    green = np.asarray(BUSH_GREEN, np.float64)
+    berry = np.asarray(BERRY_RGB, np.float64)
+
+    assert rgb[0].tolist() == pytest.approx(green.tolist(), abs=1e-7)  # stock 0
+    assert rgb[1].tolist() == pytest.approx(
+        (0.5 * green + 0.5 * berry[1]).tolist(), abs=1e-7
+    )
+    assert rgb[2].tolist() == pytest.approx(berry[2].tolist(), abs=1e-7)  # stock 1
+
+
+def test_dead_bush_keeps_its_colour():
+    cfg = make_cfg()
+    state = set_stock(state_of(cfg), [0.5, 0.5], kinds=[0, 0], alive=[False, True])
+    arena = state.entities.bush
+    rgb = np.asarray(arena.look.rgb).copy()
+    rgb[0] = [0.1, 0.2, 0.3]
+    arena = update(arena, look=update(arena.look, rgb=jnp.asarray(rgb, jnp.float32)))
+    state = update(state, entities=update(state.entities, bush=arena))
+
+    out = environment.bush_appearance(state.entities.bush)
+    colours = np.asarray(out.look.rgb)
+    assert colours[0].tolist() == pytest.approx([0.1, 0.2, 0.3], abs=1e-7)
+    expected_live = 0.5 * np.asarray(BUSH_GREEN, np.float64) + 0.5 * np.asarray(BERRY_RGB[0])
+    assert colours[1].tolist() == pytest.approx(expected_live.tolist(), abs=1e-7)
+
+
+def test_environment_updates_bush_colour_from_the_new_stock():
+    cfg = make_cfg()
+    state = set_stock(state_of(cfg), [0.0, 0.5, 1.0], kinds=[0, 1, 2])
+    out, _ = environment.apply(state, cfg)
+    stock = np.asarray(out.entities.bush.edible.stock, np.float64)
+    rgb = np.asarray(out.entities.bush.look.rgb, np.float64)
+    green = np.asarray(BUSH_GREEN, np.float64)
+    berry = np.asarray(BERRY_RGB, np.float64)
+    for slot, kind in enumerate((0, 1, 2)):
+        expected = green * (1.0 - stock[slot]) + berry[kind] * stock[slot]
+        assert rgb[slot].tolist() == pytest.approx(expected.tolist(), abs=1e-6)
+
+
 def test_apply_traces_under_jit():
     cfg = make_cfg()
     state = put_neutral(state_of(cfg), 0, [8.0, 8.0], heading=0.5, timer=3)
+    state = set_carcass(state, 0, [0.5, 0.4, 0.1], age=3)
+    state = set_stock(state, [0.5, 0.6], kinds=[0, 1])
     state = at_tick(state, 10)
     compiled = jax.jit(environment.apply, static_argnums=(1,))
     out, buffer = compiled(state, cfg)
     out, buffer = compiled(out, cfg)
     assert out.entities.neutral.transform.pos.shape == (2, 2)
+    assert out.ledger.transfer_from.shape == (C.N_NUTRIENTS,)
+    assert out.ledger.outflow.shape == (C.N_OUTFLOW_CATEGORIES, C.N_NUTRIENTS)
     assert int(buffer.count) == 1
+
+
+def test_compiled_ledger_matches_eager():
+    cfg = make_cfg()
+    state = set_carcass(state_of(cfg), 0, [0.5, 0.4, 0.1], age=600)
+    state = set_carcass(state, 1, [0.25, 0.25, 0.1], age=5)
+    eager, _ = environment.apply(state, cfg)
+    compiled, _ = jax.jit(environment.apply, static_argnums=(1,))(state, cfg)
+    for name in ("inflow", "outflow", "transfer_from", "transfer_to", "digested"):
+        assert np.array_equal(
+            np.asarray(getattr(eager.ledger, name)),
+            np.asarray(getattr(compiled.ledger, name)),
+        ), name

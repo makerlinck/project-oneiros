@@ -14,6 +14,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from life_sandbox.brain.genome import layout as brain_layout
 from life_sandbox.config import Config
 from life_sandbox.core import components as C
 from life_sandbox.core import genome as G
@@ -47,9 +48,8 @@ def random_genome(key: jax.Array, n: int, cfg: Config) -> jax.Array:
     """
     keys = jax.random.split(key, 7)
     channels = cfg.sensors.odor_channels
-    genome = (
-        jax.random.normal(keys[0], (n, cfg.brain.genome_dim), dtype=jnp.float32) * K.GENOME_INIT_STD
-    )
+    genome_dim = brain_layout(cfg).total
+    genome = jax.random.normal(keys[0], (n, genome_dim), dtype=jnp.float32) * K.GENOME_INIT_STD
     diet_logits = jnp.stack(
         [
             jax.random.normal(keys[1], (n,), dtype=jnp.float32) * K.FOUNDER_LOGIT_STD,
@@ -88,7 +88,9 @@ def body_from_genome(genome: jax.Array, cfg: Config) -> C.Body:
     n = genome.shape[0]
     diet = diet_from_genome(genome, cfg)
     reserves = K.FOUNDER_RESERVE_FRACTION * diet
-    tissue = K.FOUNDER_TISSUE_FRACTION * jnp.asarray(K.FLESH_COMP, dtype=jnp.float32)[None, :]
+    # Adult tissue follows from the growth rule: newborn 0.03 + 0.1 per grown
+    # mass unit over (1.0 - 0.3) => 0.10 * c_flesh (SANDBOX.md §5.2, §5.5).
+    tissue = K.ADULT_TISSUE_FRACTION * jnp.asarray(K.FLESH_COMP, dtype=jnp.float32)[None, :]
     tissue = jnp.broadcast_to(tissue, (n, C.N_NUTRIENTS))
     return C.Body(
         G=jnp.zeros((n, C.N_NUTRIENTS), dtype=jnp.float32),
@@ -219,7 +221,7 @@ def _place_founders(state: WorldState, cfg: Config, key: jax.Array) -> WorldStat
     )
     shape = C.Shape(
         radius=_pad(jnp.full(n, K.FOUNDER_RADIUS, dtype=jnp.float32), capacity),
-        mass=_pad(jnp.full(n, K.FOUNDER_MASS, dtype=jnp.float32), capacity),
+        mass=_pad(jnp.full(n, K.ADULT_MASS, dtype=jnp.float32), capacity),
     )
     look_values = look_from_genome(genome, cfg)
     look = C.Look(rgb=_pad(look_values.rgb, capacity), odor=_pad(look_values.odor, capacity))
@@ -239,6 +241,7 @@ def _place_founders(state: WorldState, cfg: Config, key: jax.Array) -> WorldStat
         age=_pad(adult.age, capacity),
         mu=_pad(adult.mu, capacity),
     )
+    lay = brain_layout(cfg)
     arena = C.CreatureArena(
         alive=_pad(jnp.ones(n, dtype=jnp.bool_), capacity),
         identity=identity,
@@ -251,9 +254,7 @@ def _place_founders(state: WorldState, cfg: Config, key: jax.Array) -> WorldStat
         grip=C.Grip.zeros(capacity),
         contact=C.Contact.zeros(capacity),
         genome=C.Genome(g=_pad(genome, capacity)),
-        brain=C.BrainState.zeros(
-            capacity, cfg.brain.h, cfg.sensors.slice_dim, cfg.brain.plastic_dim
-        ),
+        brain=C.BrainState.zeros(capacity, cfg.brain.h, lay.d, lay.plastic_dim),
         motor=C.Motor.zeros(capacity),
         focal=C.Focal.zeros(capacity),
     )
@@ -304,7 +305,6 @@ def _place_neutrals(state: WorldState, cfg: Config, key: jax.Array) -> WorldStat
 
 def _sample_pain_weights(state: WorldState, cfg: Config, key: jax.Array) -> WorldState:
     """Per-run unit mixing vectors for the pain bundle (SANDBOX.md §5.6)."""
-    channels = cfg.sensors.odor_channels
-    weights = jax.random.normal(key, (C.N_PAIN_SOURCES, channels), dtype=jnp.float32)
+    weights = jax.random.normal(key, (C.N_PAIN_SOURCES, C.N_PAIN_CHANNELS), dtype=jnp.float32)
     weights = weights / jnp.maximum(jnp.linalg.norm(weights, axis=1, keepdims=True), 1e-6)
     return update(state, pain_weights=weights)

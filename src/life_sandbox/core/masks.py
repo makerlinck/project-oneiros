@@ -18,6 +18,26 @@ from life_sandbox.core.components import (
 )
 
 
+# int32 uid counters (SANDBOX.md §3.1, documented deviation from int64).  A run
+# that approaches 2**31 must stop loudly instead of wrapping.  One million slots
+# of headroom is far beyond any planned world lifetime.
+UID_MAX: int = 2**31 - 1
+UID_HEADROOM: int = 1_000_000
+
+
+def ensure_uid_headroom(counter) -> None:
+    """Host-side guard: stop before the int32 uid counter can wrap."""
+    value = int(counter)
+    if value > UID_MAX - UID_HEADROOM:
+        raise RuntimeError(
+            "uid counter "
+            + str(value)
+            + " is within "
+            + str(UID_HEADROOM)
+            + " of the int32 limit; stop the run and archive the world"
+        )
+
+
 def first_free_slot(alive: jax.Array) -> jax.Array:
     """Lowest free slot index, or -1 when the arena is full."""
     has_free = jnp.any(~alive)

@@ -3,7 +3,7 @@
 SANDBOX 6.2: "turning on the Hebbian code path but forcing eta to 0 must be
 bit-identical to turning plasticity off".  Both comparisons run the real think+learn
 systems on the same initial state and compare the full state hash, so any stray
-state write (fast weights, last_pre/last_post, s_hat) shows up.
+state write (fast weights, e/h_prev, s_hat) shows up.
 
 Forcing eta to 0: decode_plastic() is monkeypatched to return eta zeros; that is
 the only difference between the two runs besides cfg.learning.plasticity.  The
@@ -26,46 +26,20 @@ from life_sandbox.config import (
     RunConfig,
     WorldConfig,
 )
-from life_sandbox.core import components as C
-from life_sandbox.core import genome as core_genome
 from life_sandbox.core.hashing import state_hash
 from life_sandbox.core.systems import learn, think
 from life_sandbox.world.init import initial_state
 
 
 def _plastic_cfg(learning: LearningConfig) -> Config:
-    h, modulators, d = 2, 2, 70
-    plastic_dim = h * d + h * h + C.N_OUTPUTS * h + d * h
-    total = (
-        core_genome.brain_base(4)
-        + 2 * h * d
-        + h * h
-        + C.N_OUTPUTS * h
-        + modulators * h
-        + (h + C.N_OUTPUTS) * modulators
-        + d * h
-        + h
-        + C.N_OUTPUTS
-        + 2 * (h + C.N_OUTPUTS)
-        + 12
-        + 1
-    )
-    cfg = Config.default().replaced(
+    """Small B0 config; genome and fast-weight widths come from the layout."""
+    return Config.default().replaced(
         capacities=Capacities(creature=4, bush=6, carcass=2, neutral=1),
         world=WorldConfig(founders=2, event_capacity=16),
         run=RunConfig(seed=3, ticks=2),
-        brain=BrainConfig(
-            kind="plastic_rnn",
-            h=h,
-            modulators=modulators,
-            genome_dim=total + 64,
-            plastic_dim=plastic_dim,
-            motion_noise=0.05,
-        ),
+        brain=BrainConfig(kind="plastic_rnn", h=2, modulators=2, motion_noise=0.05),
         learning=learning,
     )
-    assert brain_genome.layout(cfg).total <= cfg.brain.genome_dim
-    return cfg
 
 
 def _ticks(state, cfg, ticks=1):

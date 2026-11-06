@@ -31,9 +31,11 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from life_sandbox.brain import genome as brain_genome
 from life_sandbox.config import Config
 from life_sandbox.core import components as C
 from life_sandbox.core import events, rng
+from life_sandbox.core.ledger import add_inflow, add_outflow
 from life_sandbox.core.state import WorldState
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems.interaction import append_events_batch
@@ -152,6 +154,8 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     # ---------------------------------------------------------------- carcass
     counter = state.uid_counter
     nca = carcass_arena.alive.shape[0]
+    nutrition = creature.body.B + 0.5 * creature.body.N + creature.body.G
+    assigned = jnp.zeros(capacity, dtype=jnp.bool_)
     if nca > 0:
         free_order = jnp.nonzero(
             ~carcass_arena.alive, size=nca, fill_value=nca
@@ -161,7 +165,6 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         assigned = dead & (dead_rank < free_count)
         carcass_slot = free_order[jnp.clip(dead_rank, 0, nca - 1)]
         index = jnp.where(assigned, carcass_slot, jnp.asarray(nca, jnp.int32))
-        nutrition = creature.body.B + 0.5 * creature.body.N + creature.body.G
         carcass_uids = counter + jnp.clip(dead_rank, 0, capacity - 1)
         carcass_arena = update(
             carcass_arena,
@@ -220,6 +223,15 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     )
 
     creature_arena = update(creature_arena, alive=creature_arena.alive & ~dead)
+    # §3.5: the other half of N never enters the carcass (death loss); when the
+    # carcass arena is full the whole edible n decomposes instead.
+    death_loss = jnp.sum(jnp.where(dead[:, None], 0.5 * creature.body.N, 0.0), axis=0)
+    decomposition = jnp.sum(
+        jnp.where((dead & ~assigned)[:, None], nutrition, 0.0), axis=0
+    )
+    ledger = state.ledger
+    ledger = add_outflow(ledger, C.OUTFLOW_DEATH_LOSS, death_loss)
+    ledger = add_outflow(ledger, C.OUTFLOW_DECOMPOSITION, decomposition)
     state = update(
         state,
         entities=update(
@@ -229,6 +241,7 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
             neutral=neutral_arena,
         ),
         uid_counter=counter,
+        ledger=ledger,
     )
 
     # ---------------------------------------------------------------- reseed
@@ -289,8 +302,9 @@ def _reseed(
     )
     uids = state.uid_counter + jnp.arange(n_seed, dtype=jnp.int32)
     index = jnp.where(seed_mask, slots, jnp.asarray(capacity, jnp.int32))
+    lay = brain_genome.layout(cfg)
     zero_brain = C.BrainState.zeros(
-        n_seed, cfg.brain.h, state.slice.shape[1], cfg.brain.plastic_dim
+        n_seed, cfg.brain.h, state.slice.shape[1], lay.plastic_dim
     )
     zero_grip = C.Grip.zeros(n_seed)
     zero_pain = C.Pain.zeros(n_seed)
@@ -316,7 +330,7 @@ def _reseed(
         ),
         shape=C.Shape(
             radius=creature.shape.radius.at[index].set(K.FOUNDER_RADIUS),
-            mass=creature.shape.mass.at[index].set(K.FOUNDER_MASS),
+            mass=creature.shape.mass.at[index].set(K.ADULT_MASS),
         ),
         look=C.Look(
             rgb=creature.look.rgb.at[index].set(look.rgb),
@@ -366,16 +380,22 @@ def _reseed(
             h=creature.brain.h.at[index].set(zero_brain.h),
             s_hat=creature.brain.s_hat.at[index].set(zero_brain.s_hat),
             w_fast=creature.brain.w_fast.at[index].set(zero_brain.w_fast),
-            last_pre=creature.brain.last_pre.at[index].set(zero_brain.last_pre),
-            last_post=creature.brain.last_post.at[index].set(zero_brain.last_post),
+            e=creature.brain.e.at[index].set(zero_brain.e),
+            h_prev=creature.brain.h_prev.at[index].set(zero_brain.h_prev),
         ),
-        motor=C.Motor(last_out=creature.motor.last_out.at[index].set(zero_motor.last_out)),
+        motor=C.Motor(
+            last_out=creature.motor.last_out.at[index].set(zero_motor.last_out),
+            u_eff=creature.motor.u_eff.at[index].set(zero_motor.u_eff),
+        ),
         focal=C.Focal(trace_slot=creature.focal.trace_slot.at[index].set(zero_focal.trace_slot)),
     )
+    # §3.5: a reseed injects the seeded bodies' B + N from outside the book.
+    seeded_mass = jnp.sum(jnp.where(seed_mask[:, None], body.N + body.B, 0.0), axis=0)
     state = update(
         state,
         entities=update(state.entities, creature=creature),
         uid_counter=state.uid_counter + jnp.sum(seed_mask).astype(jnp.int32),
+        ledger=add_inflow(state.ledger, C.INFLOW_RESEED, seeded_mass),
     )
     buffer = append_events_batch(
         buffer,

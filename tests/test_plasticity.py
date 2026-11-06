@@ -21,7 +21,6 @@ from life_sandbox.config import (
     WorldConfig,
 )
 from life_sandbox.core import components as C
-from life_sandbox.core import genome as core_genome
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems import learn, plasticity, prediction
 from life_sandbox.world.init import initial_state
@@ -169,23 +168,8 @@ def test_prediction_delta_rule_clips():
 # --- learn system end to end -------------------------------------------------
 
 def _plastic_cfg(h: int = 2, modulators: int = 2, learning: LearningConfig | None = None) -> Config:
-    d = 70
-    plastic_dim = h * d + h * h + C.N_OUTPUTS * h + d * h
-    total = (
-        core_genome.brain_base(4)
-        + 2 * h * d
-        + h * h
-        + C.N_OUTPUTS * h
-        + modulators * h
-        + (h + C.N_OUTPUTS) * modulators
-        + d * h
-        + h
-        + C.N_OUTPUTS
-        + 2 * (h + C.N_OUTPUTS)
-        + 12
-        + 1
-    )
-    cfg = Config.default().replaced(
+    """Small B0 config; genome and fast-weight widths come from the layout."""
+    return Config.default().replaced(
         capacities=Capacities(creature=4, bush=6, carcass=2, neutral=1),
         world=WorldConfig(founders=2, event_capacity=16),
         run=RunConfig(seed=3, ticks=2),
@@ -193,14 +177,10 @@ def _plastic_cfg(h: int = 2, modulators: int = 2, learning: LearningConfig | Non
             kind="plastic_rnn",
             h=h,
             modulators=modulators,
-            genome_dim=total + 64,
-            plastic_dim=plastic_dim,
             motion_noise=0.05,
         ),
         learning=LearningConfig() if learning is None else learning,
     )
-    assert brain_genome.layout(cfg).total <= cfg.brain.genome_dim
-    return cfg
 
 
 def test_learn_step_matches_rule_with_constant_genome():
@@ -221,7 +201,7 @@ def test_learn_step_matches_rule_with_constant_genome():
         ],
         dtype=jnp.float32,
     )
-    genome = jnp.zeros((n, cfg.brain.genome_dim), dtype=jnp.float32)
+    genome = jnp.zeros((n, lay.genome_dim), dtype=jnp.float32)
     genome = genome.at[:, lay.w_mod].set(0.5)
     genome = genome.at[:, lay.g].set(0.25)
     genome = genome.at[:, lay.log_eta].set(jnp.log(0.5))
@@ -243,7 +223,7 @@ def test_learn_step_matches_rule_with_constant_genome():
     creature = update(creature, genome=update(creature.genome, g=genome))
     creature = update(
         creature,
-        brain=update(creature.brain, h=h, last_pre=e, last_post=h_prev),
+        brain=update(creature.brain, h=h, e=e, h_prev=h_prev),
         motor=update(creature.motor, last_out=out),
     )
     state = update(state, entities=update(state.entities, creature=creature), slice=s)

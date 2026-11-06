@@ -22,16 +22,16 @@ name.  Two paths exist in M0:
        Motor.last_out = out_t.
   Two extra BrainState slots carry what learn needs so think and learn use
   bitwise the same e_t (SANDBOX 3.3 step 5: "learn uses e_t = s_t - s_hat_t"):
-      last_pre  <- e_t       (D slots; learn cannot recompute it because
-                              s_hat has already been overwritten with
-                              s_hat_(t+1))
-      last_post <- h_(t-1)   (H slots; W_rec pre and the W_pred delta rule
-                              need it)
-  Decision recorded here: SANDBOX 3.2 describes last_pre/last_post as "the pre
-  and post activities of the previous step"; this implementation reuses the two
-  slots as the error and the previous hidden state, which is what the M0 rules
-  actually need.  m_t is not stored (BrainState has no slot for it); learn
-  recomputes it from h_t and W_mod, a pure function of the state.
+      BrainState.e      <- e_t       (D slots; learn cannot recompute it
+                                      because s_hat has already been overwritten
+                                      with s_hat_(t+1))
+      BrainState.h_prev <- h_(t-1)   (H slots; W_rec pre and the W_pred delta
+                                      rule need it)
+  Decision recorded here: SANDBOX 3.2 names the slots "pre and post activities
+  of the previous step"; this implementation uses them as the prediction error
+  and the previous hidden state, which is what the M0 rules actually need.  m_t
+  is not stored (BrainState has no slot for it); learn recomputes it from h_t
+  and W_mod, a pure function of the state.
 
 Other cfg.brain.kind values are candidate architectures of SANDBOX 6.4 that are
 not implemented in M0; they raise NotImplementedError at trace time (the kind is
@@ -98,8 +98,8 @@ def _plastic_rnn(state: WorldState, cfg: Config) -> WorldState:
         creature.brain,
         h=result.h,
         s_hat=result.prediction,
-        last_pre=e,
-        last_post=h_prev,
+        e=e,
+        h_prev=h_prev,
     )
     motor = update(creature.motor, last_out=result.out)
     creature = update(creature, brain=brain, motor=motor)

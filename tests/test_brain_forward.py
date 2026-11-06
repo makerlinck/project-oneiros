@@ -19,6 +19,7 @@ from life_sandbox.config import (
     Config,
     LearningConfig,
     RunConfig,
+    Sensors,
     WorldConfig,
 )
 from life_sandbox.core import components as C
@@ -184,24 +185,8 @@ def test_prediction_switch_silences_error_units_and_prediction():
 # --- genome layout -----------------------------------------------------------
 
 def _plastic_cfg(h: int = 2, modulators: int = 2, learning: LearningConfig | None = None) -> Config:
-    """Small B0 config whose genome fits exactly with a little slack."""
-    d = 70
-    plastic_dim = h * d + h * h + C.N_OUTPUTS * h + d * h
-    total = (
-        core_genome.brain_base(4)
-        + 2 * h * d
-        + h * h
-        + C.N_OUTPUTS * h
-        + modulators * h
-        + (h + C.N_OUTPUTS) * modulators
-        + d * h
-        + h
-        + C.N_OUTPUTS
-        + 2 * (h + C.N_OUTPUTS)
-        + 12
-        + 1
-    )
-    cfg = Config.default().replaced(
+    """Small B0 config; genome and fast-weight widths come from the layout."""
+    return Config.default().replaced(
         capacities=Capacities(creature=4, bush=6, carcass=2, neutral=1),
         world=WorldConfig(founders=2, event_capacity=16),
         run=RunConfig(seed=3, ticks=2),
@@ -209,21 +194,18 @@ def _plastic_cfg(h: int = 2, modulators: int = 2, learning: LearningConfig | Non
             kind="plastic_rnn",
             h=h,
             modulators=modulators,
-            genome_dim=total + 64,
-            plastic_dim=plastic_dim,
             motion_noise=0.05,
         ),
         learning=LearningConfig() if learning is None else learning,
     )
-    assert brain_genome.layout(cfg).total <= cfg.brain.genome_dim
-    return cfg
 
 
-def test_layout_is_contiguous_and_fits():
+def test_layout_is_contiguous_and_derives_widths():
     cfg = _plastic_cfg()
     lay = brain_genome.layout(cfg)
     assert lay.base == core_genome.brain_base(cfg.sensors.odor_channels)
-    assert lay.total <= cfg.brain.genome_dim
+    # Widths are derived from the layout, not configured.
+    assert lay.genome_dim == lay.total
     order = (
         "w_in",
         "w_err",
@@ -257,14 +239,37 @@ def test_layout_is_contiguous_and_fits():
     assert sizes["log_lambda"] == lay.post
     assert sizes["hebb"] == 12
     assert sizes["log_eta_p"] == 1
-    assert lay.plastic_dim == cfg.brain.plastic_dim
+    assert lay.plastic_dim == lay.h * lay.d + lay.h * lay.h + lay.n_out * lay.h + lay.d * lay.h
+
+
+def test_default_b0_widths():
+    # Concrete invariant of the default B0 genome (SANDBOX 6.3; H=32, D=70, M=4,
+    # N_OUT=6): shared header 11 + brain blocks 8343 = 8354; fast weights 5696.
+    lay = brain_genome.layout(Config.default())
+    assert lay.total == 8354
+    assert lay.genome_dim == 8354
+    assert lay.plastic_dim == 5696
+
+
+def test_layout_width_follows_slice_width():
+    base_lay = brain_genome.layout(Config.default())
+    wide_cfg = Config.default().replaced(sensors=Sensors(sound_channels=2))
+    assert wide_cfg.sensors.slice_dim == 74  # SANDBOX 5.6: +2*S sound channels
+    wide = brain_genome.layout(wide_cfg)
+    extra = wide.d - base_lay.d
+    assert extra == 4
+    # W_in, W_err and W_pred each gain H slots per slice dimension; W_fast only
+    # holds W_in and W_pred (W_err is slow-only).
+    assert wide.total == base_lay.total + extra * (3 * wide.h)
+    assert wide.plastic_dim == base_lay.plastic_dim + extra * (2 * wide.h)
+    assert wide.block_sizes()["w_in"] == wide.h * (base_lay.d + extra)
 
 
 def test_decode_slow_reads_each_documented_block():
     cfg = _plastic_cfg()
     lay = brain_genome.layout(cfg)
     n = 2
-    filled = jnp.zeros((n, cfg.brain.genome_dim), dtype=jnp.float32)
+    filled = jnp.zeros((n, lay.genome_dim), dtype=jnp.float32)
     values = {
         "w_in": 0.5,
         "w_err": -0.25,
@@ -296,7 +301,7 @@ def test_decode_plastic_uses_logs():
     cfg = _plastic_cfg()
     lay = brain_genome.layout(cfg)
     n = 2
-    genome = jnp.zeros((n, cfg.brain.genome_dim), dtype=jnp.float32)
+    genome = jnp.zeros((n, lay.genome_dim), dtype=jnp.float32)
     genome = genome.at[:, lay.log_eta].set(-1.0)
     genome = genome.at[:, lay.log_lambda].set(-2.0)
     genome = genome.at[:, lay.log_eta_p].set(-3.0)
@@ -315,7 +320,7 @@ def test_fast_weight_split_join_roundtrip():
     cfg = _plastic_cfg()
     lay = brain_genome.layout(cfg)
     n = 3
-    w_fast = jax.random.normal(jax.random.key(0), (n, cfg.brain.plastic_dim), dtype=jnp.float32)
+    w_fast = jax.random.normal(jax.random.key(0), (n, lay.plastic_dim), dtype=jnp.float32)
     fast = brain_genome.split_fast(w_fast, lay)
     assert fast.w_in.shape == (n, lay.h, lay.d)
     assert fast.w_rec.shape == (n, lay.h, lay.h)
@@ -328,7 +333,8 @@ def test_mutation_sigmas_per_block():
     cfg = _plastic_cfg()
     lay = brain_genome.layout(cfg)
     sigma = brain_genome.mutation_sigmas(cfg)
-    assert sigma.shape == (cfg.brain.genome_dim,)
+    assert lay.genome_dim == lay.total
+    assert sigma.shape == (lay.total,)
     assert sigma.dtype == jnp.float32
     odor = int(cfg.sensors.odor_channels)
     assert bool(jnp.all(sigma[core_genome.diet_logits_slice()] == 0.05))
@@ -341,9 +347,6 @@ def test_mutation_sigmas_per_block():
     # Log rates mutate at 0.1.
     for name in ("log_eta", "log_lambda", "log_eta_p"):
         assert bool(jnp.all(sigma[getattr(lay, name)] == 0.1))
-    # Slots beyond the layout keep the default weight scale.
-    if lay.total < cfg.brain.genome_dim:
-        assert bool(jnp.all(sigma[lay.total :] == 0.02))
 
 
 # --- think wiring ------------------------------------------------------------
@@ -377,8 +380,8 @@ def test_think_writes_b0_forward():
     out_creature = after.entities.creature
     assert bool(jnp.array_equal(out_creature.brain.h, expected.h))
     assert bool(jnp.array_equal(out_creature.brain.s_hat, expected.prediction))
-    assert bool(jnp.array_equal(out_creature.brain.last_pre, e))
-    assert bool(jnp.array_equal(out_creature.brain.last_post, creature.brain.h))
+    assert bool(jnp.array_equal(out_creature.brain.e, e))
+    assert bool(jnp.array_equal(out_creature.brain.h_prev, creature.brain.h))
     assert bool(jnp.array_equal(out_creature.motor.last_out, expected.out))
 
 
@@ -390,8 +393,8 @@ def test_think_prediction_off_keeps_hat_zero():
 
 
 def test_default_size_think_learn_traces_under_jit():
-    # Production runner shape: default H=32 / D=70 / genome_dim=8400 in a scan
-    # over a small arena; only the capability switch differs from the M0 arm.
+    # Production runner shape: default H=32 / D=70 (derived genome 8354) in a
+    # jit over a small arena; only the capability switch differs from the M0 arm.
     cfg = Config.default().replaced(
         capacities=Capacities(creature=4, bush=6, carcass=2, neutral=1),
         world=WorldConfig(founders=2, event_capacity=16),

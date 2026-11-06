@@ -28,8 +28,9 @@ Documented decisions where SANDBOX.md is silent:
   `occupied`, and a living target may resist with the escape rule
   (`escaped`).
 - Escape rule (§5.4): |u'_acc| * a_max of the creature > 0.03 *
-  (1 + k_holder) * g_holder.  u'_acc is re-derived from the motion key; keys
-  are stateless, so reading the same noise twice consumes no randomness.
+  (1 + k_holder) * g_holder.  u'_acc is read from Motor.u_eff, the effective
+  control the motion system applied this tick; the noise is never re-derived
+  from the motion key here.
 - Held living creatures try to escape once at the start of the tick; both
   references are cleared and an `escape` event is emitted.  The same condition
   is what makes a free living target resist a grab this tick.
@@ -57,6 +58,7 @@ import jax.numpy as jnp
 from life_sandbox.config import Config
 from life_sandbox.core import components as C
 from life_sandbox.core import events, masks, rng
+from life_sandbox.core.ledger import add_inflow
 from life_sandbox.core.state import WorldState
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems import motor
@@ -254,7 +256,9 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
 
     creature = entities.creature
     last = creature.motor.last_out
-    acc, _ = motor.perturbed_controls(state, cfg)
+    # Effective controls u' written by the motion system (§5.3).  Escape uses
+    # |u_acc'|; the noise is never re-derived from the motion key here.
+    u_eff = creature.motor.u_eff
     a_max = motor.max_acceleration(state)
     knob = motor.intended_knob(state)
     efficiency = motor.body_efficiency(creature.body)
@@ -284,7 +288,7 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     holder_slot = jnp.clip(held_by.slot, 0, n - 1)
     holder_ok = holder_ok & alive[holder_slot]
     escape = holder_ok & (
-        jnp.abs(acc) * a_max
+        jnp.abs(u_eff[:, 0]) * a_max
         > _ESCAPE_SCALE * (1.0 + knob[holder_slot]) * efficiency[holder_slot]
     )
     buffer = append_events_batch(
@@ -485,7 +489,7 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
             _take_1d(held_by_neutral, grab_slot),
         ),
     )
-    resistance = (jnp.abs(acc)[None, :] * a_max[None, :]) > (
+    resistance = (jnp.abs(u_eff[:, 0])[None, :] * a_max[None, :]) > (
         _ESCAPE_SCALE * (1.0 + knob[:, None]) * efficiency[:, None]
     )
     resist = jnp.where(
@@ -770,5 +774,10 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         reason=bite_reason,
     )
 
+    # §3.5 nutrient book: only bites on bushes cross the boundary (the mass is
+    # taken from the berry book outside it).  Bites on carcasses and living
+    # creatures move nutrients inside the book and are not recorded.
+    bush_dn = jnp.where((content_active & (bite_kind == C.BUSH))[:, None], dn, 0.0)
+    ledger = add_inflow(state.ledger, C.INFLOW_BITES, jnp.sum(bush_dn, axis=0))
     entities = update(entities, creature=creature)
-    return update(state, entities=entities), buffer
+    return update(state, entities=entities, ledger=ledger), buffer

@@ -24,6 +24,9 @@ BRAIN_KINDS = ("bootstrap", "plastic_rnn", "slice_transformer", "queue_rnn", "qu
 class RunConfig:
     seed: int = 0
     ticks: int = 200
+    # Ticks per compiled lax.scan segment (SANDBOX.md §3.3).  K is a throughput
+    # knob only: the same run must produce the same hashes for any K.
+    segment_ticks: int = 64
 
 
 @dataclass(frozen=True)
@@ -38,7 +41,13 @@ class WorldConfig:
     odor_decay: float = 0.02
     odor_scale: int = 1_000_000
     founders: int = 64
+    # Startup ramp (SANDBOX.md §9): environment conditions interpolate from a
+    # permissive state (tick 0) to the target values at ramp_ticks.  Values are
+    # calibration placeholders for M1.
     ramp_ticks: int = 0
+    ramp_berry_multiplier: float = 3.0
+    ramp_metabolism_multiplier: float = 0.5
+    ramp_temperature_multiplier: float = 0.2
     event_capacity: int = 2048
     # Calibration placeholders: L is measured in M1 (PRINCIPLES section 7 stage 0),
     # c_switch is an experiment factor {0.25, 0.5, 1, 2, 4} (SANDBOX section 4.4).
@@ -105,11 +114,10 @@ class BrainConfig:
     kind: str = "bootstrap"
     h: int = 32
     modulators: int = 4
-    # §6.5 estimates ~8.3k; the exact B0 block (weights, G per post unit, biases,
-    # per-unit eta/lambda, A-D, eta_p) needs 8354 including the shared header.
-    genome_dim: int = 8400
-    plastic_dim: int = 5696
     motion_noise: float = 0.05
+    # Genome width and fast-weight width are NOT configured: brain.genome.layout
+    # derives them from H, D, M and N_OUT (SANDBOX.md §6.3).  §6.5's table is a
+    # size report, not a knob.
 
 
 @dataclass(frozen=True)
@@ -186,9 +194,26 @@ class Config:
             raise ValueError("world.event_capacity must be positive")
         if self.world.l_ticks <= 0 or self.world.c_switch <= 0:
             raise ValueError("world.l_ticks and world.c_switch must be positive")
+        if self.run.ticks < 0 or self.run.segment_ticks <= 0:
+            raise ValueError("run.ticks must be >= 0 and run.segment_ticks > 0")
+        if self.world.ramp_ticks < 0:
+            raise ValueError("world.ramp_ticks must be >= 0")
+        for name in (
+            "ramp_berry_multiplier",
+            "ramp_metabolism_multiplier",
+            "ramp_temperature_multiplier",
+        ):
+            if getattr(self.world, name) <= 0:
+                raise ValueError("world." + name + " must be positive")
         if self.brain.kind not in BRAIN_KINDS:
             raise ValueError(
                 "brain.kind must be one of " + repr(BRAIN_KINDS) + ", got " + repr(self.brain.kind)
+            )
+        if self.learning.readable_leak:
+            raise ValueError(
+                "learning.readable_leak is not implemented until M3 stage 3: the leak "
+                "arm rewrites the slice width, and BrainState/genome widths now follow "
+                "the derived layout (SANDBOX.md §5.6, §6.3)"
             )
         if self.learning.eta_granularity not in ETA_GRANULARITIES:
             raise ValueError(

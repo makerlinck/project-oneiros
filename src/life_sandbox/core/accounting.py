@@ -4,43 +4,45 @@ The nutrient book tracks all nutrient mass inside the living world:
 
     stock_j = sum_alive_creatures (G_j + N_j + B_j) + sum_alive_carcasses n_j
 
-External inflow is measured from the event buffer: every bite whose target is a
-bush takes `dn` from the berry mass outside the nutrient book and adds it to the
-biter's stomach.  Internal transfers (digestion G->N, absorption N, growth
-N->B, bites on carcasses and living creatures, birth payments) cancel exactly
-because they only move mass between the tracked pools.
+Systems write their flows into the per-tick `Ledger` draft area where they
+happen (interaction, body, reproduce, die; environment writes rot transfers and
+decomposition), and `step.run` returns the float64 sums over the segment.  This
+module turns those ledger totals into a closed-book report:
 
-Outflow categories of §3.5 (metabolic demand, unabsorbed plant/animal matter,
-reserve overflow, unabsorbed toxin leaving through X, birth loss, death loss,
-carcass decomposition) are *not* individually observable from the state and
-the event buffer in M0: the event schema has no metabolic event and WorldState
-carries no flow counters.  `nutrient_books` therefore reports the measured
-residual outflow `inflow - delta_stock` (mass conservation) and allows the
-caller to pass an independently computed `outflow` (for example the sum of
-system-reported flows in a Ledger) to be checked against it.  The berry-mass
-book is fully checkable without extra reporting:
+    inflow_j - outflow_j + transfer_to_j - transfer_from_j = delta_stock_j
 
-    regeneration = bitten_mass + delta_stock     (§3.5, "berry mass book")
+where the internal conversions that SANDBOX.md §3.5 asks to record separately
+(carcass rot P/A -> T) appear as transfer terms, and the separate check
+`sum(transfer_from) == sum(transfer_to)` verifies that conversions conserve
+mass.  All comparisons use the relative-error rule of §3.5 (rtol < 1e-5).
 
-This module is host-side (numpy, float64) and observer-like: it never enters
-the pure-function state path, never consumes randomness and never writes state,
-so opening accounting cannot change a run (PRINCIPLES.md §2.3).
+The berry-mass book is separate from the nutrient book:
 
-Closed-book tolerance: relative error < 1e-5 per type (§3.5).
+    regeneration = bitten_mass + delta_bush_stock
+
+with `bitten_mass` taken from `inflow[INFLOW_BITES].sum()` (the mass crossed
+from the berry book into the nutrient book).  For a one-tick segment the
+regeneration can be derived from the start state; for longer segments the
+caller must pass the summed regeneration explicitly (the engine does not keep a
+second berry-mass ledger in M0).
+
+This module is host-side (numpy, float64) and observer-like: it never enters the
+pure-function state path, never consumes randomness and never writes state, so
+opening accounting cannot change a run (PRINCIPLES.md §2.3).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
 from life_sandbox.core import components as C
-from life_sandbox.core import events
 
 RTOL: float = 1e-5
-BERRY_REGEN_RATE: float = 0.03
-BERRY_REGEN_BASE: float = 1e-4
+# Mirror of the environment's berry regeneration (§4.2).
+BERRY_GROWTH: float = 0.03
+BERRY_SEED: float = 1e-4
 
 
 def _array(value) -> np.ndarray:
@@ -67,25 +69,17 @@ def berry_stock(state) -> float:
 
 
 def berry_regeneration(state) -> float:
-    """Berry regeneration produced by one environment tick from this state (§4.2)."""
+    """Berry regeneration one environment tick produces from this state (§4.2).
+
+    The environment clips the stock to [0, 1]; the increment is therefore
+    min(growth, 1 - stock) per bush, which is mirrored here.
+    """
     ents = state.entities
     stock = _array(ents.bush.edible.stock)
     alive = _array(ents.bush.alive)
-    regen = BERRY_REGEN_RATE * stock * (1.0 - stock) + BERRY_REGEN_BASE
-    return float((regen * alive).sum())
-
-
-def event_bite_flow(buffer: events.EventBuffer) -> tuple[np.ndarray, float]:
-    """Nutrient inflow and bitten berry mass from bush bites in the buffer."""
-    count = int(buffer.count)
-    if count == 0:
-        return np.zeros(C.N_NUTRIENTS, dtype=np.float64), 0.0
-    kind = _array(buffer.kind[:count])
-    target = _array(buffer.target_kind[:count])
-    dn = _array(buffer.dn[:count])
-    mask = (kind == events.kind_code("bite")) & (target == C.BUSH)
-    taken = dn[mask]
-    return taken.sum(axis=0), float(taken.sum())
+    growth = BERRY_GROWTH * stock * (1.0 - stock) + BERRY_SEED
+    added = np.minimum(growth, np.maximum(1.0 - stock, 0.0))
+    return float((added * alive).sum())
 
 
 def check_books(
@@ -102,6 +96,17 @@ def check_books(
     return relative, bool(np.all(relative < rtol))
 
 
+def check_transfers(result, rtol: float = RTOL) -> tuple[np.ndarray, bool]:
+    """Check that recorded internal conversions conserve mass (§3.5)."""
+    from_amount = _array(result.transfer_from)
+    to_amount = _array(result.transfer_to)
+    lhs = np.sum(from_amount)
+    rhs = np.sum(to_amount)
+    scale = max(1.0, abs(float(lhs)), abs(float(rhs)))
+    relative = np.asarray(abs(lhs - rhs) / scale)
+    return relative, bool(relative < rtol)
+
+
 @dataclass(frozen=True)
 class Books:
     """A closed-book report for one segment and one book (nutrient or berry)."""
@@ -112,6 +117,10 @@ class Books:
     relative_error: np.ndarray
     closed: bool
     dropped_events: int = 0
+    transfer_from: np.ndarray | None = None
+    transfer_to: np.ndarray | None = None
+    transfer_relative_error: np.ndarray | None = None
+    transfers_closed: bool = True
     note: str = ""
 
 
@@ -123,6 +132,10 @@ def books(
     *,
     rtol: float = RTOL,
     dropped_events: int = 0,
+    transfer_from: np.ndarray | None = None,
+    transfer_to: np.ndarray | None = None,
+    transfer_relative_error: np.ndarray | None = None,
+    transfers_closed: bool = True,
     note: str = "",
 ) -> Books:
     """Assemble a Books report from explicit flows and endpoint stocks."""
@@ -137,110 +150,82 @@ def books(
         relative_error=relative,
         closed=closed,
         dropped_events=int(dropped_events),
+        transfer_from=transfer_from,
+        transfer_to=transfer_to,
+        transfer_relative_error=transfer_relative_error,
+        transfers_closed=transfers_closed,
         note=note,
     )
 
 
-def nutrient_books(
-    start,
-    end,
-    buffer: events.EventBuffer,
-    *,
-    outflow: np.ndarray | None = None,
-    rtol: float = RTOL,
-) -> Books:
-    """Nutrient books for a segment.
+def nutrient_books(start, end, result, *, rtol: float = RTOL) -> Books:
+    """Nutrient books for a segment, from the run's float64 ledger totals.
 
-    Inflow is measured from bush-bite events.  When `outflow` is not supplied
-    it is the conservation residual `inflow - delta_stock` (the book closes by
-    construction); pass independently computed outflows to test them against
-    the residual.
+    `result` is a `core.step.RunResult`.  Internal conversions recorded as
+    transfers enter the balance on the receiving/sending side (§3.5), and
+    `transfers_closed` checks that they conserve total mass.
     """
-    inflow, _ = event_bite_flow(buffer)
+    inflow = _array(result.inflow).sum(axis=0)
+    outflow = _array(result.outflow).sum(axis=0)
+    transfer_from = _array(result.transfer_from)
+    transfer_to = _array(result.transfer_to)
     start_stock = nutrient_stock(start)
     end_stock = nutrient_stock(end)
     delta = end_stock - start_stock
-    if outflow is None:
-        outflow = inflow - delta
-        note = "outflow is the conservation residual"
-    else:
-        note = "outflow supplied by the caller"
-    return books(
-        inflow,
-        outflow,
-        start_stock,
-        end_stock,
-        rtol=rtol,
-        dropped_events=int(buffer.dropped),
-        note=note,
+    # inflow + transfer_to = outflow + transfer_from + delta.
+    relative, closed = check_books(
+        inflow + transfer_to, outflow + transfer_from, delta, rtol
+    )
+    transfer_relative, transfers_closed = check_transfers(result, rtol)
+    return Books(
+        inflow=inflow,
+        outflow=outflow,
+        delta=delta,
+        relative_error=relative,
+        closed=closed,
+        dropped_events=int(result.dropped_events),
+        transfer_from=transfer_from,
+        transfer_to=transfer_to,
+        transfer_relative_error=transfer_relative,
+        transfers_closed=transfers_closed,
+        note="nutrient book from ledger totals; transfers recorded separately",
     )
 
 
 def berry_books(
     start,
     end,
-    buffer: events.EventBuffer,
+    result,
     *,
     regeneration: float | None = None,
     rtol: float = RTOL,
 ) -> Books:
-    """Berry-mass book: regeneration = bitten mass + delta stock (§3.5)."""
+    """Berry-mass book: regeneration = bitten mass + delta stock (§3.5).
+
+    `bitten` comes from `result.inflow[INFLOW_BITES].sum()`.  For a one-tick
+    segment `regeneration` defaults to the start state's regen; pass the summed
+    regeneration for longer segments.
+    """
     if regeneration is None:
         regeneration = berry_regeneration(start)
-    _, bitten = event_bite_flow(buffer)
-    inflow = np.asarray([regeneration], dtype=np.float64)
-    outflow = np.asarray([bitten], dtype=np.float64)
+    bitten = float(np.sum(_array(result.inflow[C.INFLOW_BITES])))
     return books(
-        inflow,
-        outflow,
+        np.asarray([regeneration], dtype=np.float64),
+        np.asarray([bitten], dtype=np.float64),
         np.asarray([berry_stock(start)], dtype=np.float64),
         np.asarray([berry_stock(end)], dtype=np.float64),
         rtol=rtol,
-        dropped_events=int(buffer.dropped),
-        note="berry mass = regeneration; outflow = bitten mass",
+        dropped_events=int(result.dropped_events),
+        note="berry mass = regeneration; outflow = bitten mass from inflow[BITES]",
     )
 
 
-@dataclass
-class Ledger:
-    """Explicit per-category flow accumulator for experiments and integration.
-
-    Categories are keyed by name, only for the report; the totals are what the
-    book check compares.  Use it to attribute outflows that the engine does not
-    report as events (metabolic demand, excretion, overflow, birth loss, ...).
-    """
-
-    inflow: np.ndarray = field(
-        default_factory=lambda: np.zeros(C.N_NUTRIENTS, dtype=np.float64)
-    )
-    outflow: np.ndarray = field(
-        default_factory=lambda: np.zeros(C.N_NUTRIENTS, dtype=np.float64)
-    )
-    inflow_categories: dict[str, np.ndarray] = field(default_factory=dict)
-    outflow_categories: dict[str, np.ndarray] = field(default_factory=dict)
-
-    def add_inflow(self, name: str, amount) -> None:
-        amount = _array(amount)
-        self.inflow += amount
-        self.inflow_categories[name] = self.inflow_categories.get(
-            name, np.zeros(C.N_NUTRIENTS, dtype=np.float64)
-        ) + amount
-
-    def add_outflow(self, name: str, amount) -> None:
-        amount = _array(amount)
-        self.outflow += amount
-        self.outflow_categories[name] = self.outflow_categories.get(
-            name, np.zeros(C.N_NUTRIENTS, dtype=np.float64)
-        ) + amount
-
-    def close(self, start, end, *, rtol: float = RTOL) -> Books:
-        delta = nutrient_stock(end) - nutrient_stock(start)
-        relative, closed = check_books(self.inflow, self.outflow, delta, rtol)
-        return Books(
-            inflow=self.inflow.copy(),
-            outflow=self.outflow.copy(),
-            delta=delta,
-            relative_error=relative,
-            closed=closed,
-            note="explicit ledger",
-        )
+def ledger_totals(result) -> dict[str, np.ndarray]:
+    """Float64 totals of every ledger field (diagnostics for tests/reports)."""
+    return {
+        "inflow": _array(result.inflow),
+        "outflow": _array(result.outflow),
+        "transfer_from": _array(result.transfer_from),
+        "transfer_to": _array(result.transfer_to),
+        "digested": _array(result.digested),
+    }

@@ -7,7 +7,7 @@ import time
 
 from life_sandbox.config import Config
 from life_sandbox.core.hashing import state_hash
-from life_sandbox.core.step import run, step
+from life_sandbox.core.step import run
 from life_sandbox.world.init import initial_state
 
 
@@ -34,16 +34,34 @@ def main(argv: list[str] | None = None) -> None:
     state = initial_state(cfg)
     ticks = int(cfg.run.ticks)
     started = time.perf_counter()
-    state, counts = run(state, cfg, ticks)
+    result = run(state, cfg, ticks)
     elapsed = time.perf_counter() - started
     rate = ticks / elapsed if elapsed > 0 else float("inf")
     print("config hash: " + cfg.config_hash())
-    print("seed: " + str(cfg.run.seed) + "  ticks: " + str(ticks) + "  state hash: " + state_hash(state))
+    print(
+        "seed: "
+        + str(cfg.run.seed)
+        + "  ticks: "
+        + str(ticks)
+        + "  state hash: "
+        + state_hash(result.state)
+    )
     print("elapsed: " + format(elapsed, ".2f") + "s  (" + format(rate, ".1f") + " ticks/s)")
-    if counts:
-        print("events: " + ", ".join(name + "=" + str(value) for name, value in sorted(counts.items())))
+    if result.counts:
+        print(
+            "events: "
+            + ", ".join(name + "=" + str(value) for name, value in sorted(result.counts.items()))
+        )
     else:
         print("events: none")
+    print(
+        "ledger: inflow="
+        + format(float(result.inflow.sum()), ".3e")
+        + " outflow="
+        + format(float(result.outflow.sum()), ".3e")
+        + " dropped_events="
+        + str(result.dropped_events)
+    )
 
 
 if __name__ == "__main__":

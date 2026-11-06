@@ -30,8 +30,9 @@ Documented decisions (SANDBOX.md is silent):
 - A parent whose tissue is insufficient fails with `no_tissue`; a parent with
   no free candidate position, or with no free creature slot left in slot
   order, fails with `no_room`.  Failed births consume no slot, uid or payment.
-- Mutation scales come from brain/genome.mutation_sigmas (§6.3); the fallback
-  keeps the module importable when the brain layout is missing.
+- Mutation scales come from brain/genome.mutation_sigmas (§6.3), and genome /
+  fast-weight widths come from brain/genome.layout(cfg): they are derived from
+  H, D, M and N_OUT, never configured by hand.
 """
 
 from __future__ import annotations
@@ -39,18 +40,15 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from life_sandbox.brain import genome as brain_genome
 from life_sandbox.config import Config
 from life_sandbox.core import components as C
 from life_sandbox.core import events, genome as core_genome, rng
+from life_sandbox.core.ledger import add_outflow
 from life_sandbox.core.state import WorldState
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems.interaction import append_events_batch
 from life_sandbox.world import init as world_init
-
-try:  # brain-specific block layout is owned by the brain module (§6.3)
-    from life_sandbox.brain import genome as brain_genome
-except Exception:  # pragma: no cover - the brain module is optional for M0
-    brain_genome = None
 
 # SANDBOX.md §5.5 / §6.3 initial values.
 CHILD_MASS: float = 0.3
@@ -61,31 +59,10 @@ THETA_REPRO_MIN: float = 0.5
 THETA_REPRO_MAX: float = 1.0
 MATURE_EPS: float = 1e-6
 
-_SIGMA_WEIGHT = 0.02
-_SIGMA_THETA = 0.02
-_SIGMA_HEADER_TRAIT = 0.05
 _CHILD_ANGLES = jnp.asarray(
     [0.0, jnp.pi / 4, -jnp.pi / 4, jnp.pi / 2, -jnp.pi / 2, 3 * jnp.pi / 4, -3 * jnp.pi / 4],
     dtype=jnp.float32,
 )
-
-
-def fallback_mutation_sigmas(cfg: Config) -> jax.Array:
-    """§6.3 block scales for the shared header; brain blocks default to 0.02."""
-    channels = int(cfg.sensors.odor_channels)
-    sigma = jnp.full((int(cfg.brain.genome_dim),), _SIGMA_WEIGHT, dtype=jnp.float32)
-    sigma = sigma.at[core_genome.diet_logits_slice()].set(_SIGMA_HEADER_TRAIT)
-    sigma = sigma.at[core_genome.color_slice()].set(_SIGMA_HEADER_TRAIT)
-    sigma = sigma.at[core_genome.odor_slice(channels)].set(_SIGMA_HEADER_TRAIT)
-    sigma = sigma.at[core_genome.theta_repro_index(channels)].set(_SIGMA_THETA)
-    return sigma
-
-
-def mutation_sigmas(cfg: Config) -> jax.Array:
-    """Per-gene mutation scale, preferring the brain layout when available."""
-    if brain_genome is not None and hasattr(brain_genome, "mutation_sigmas"):
-        return brain_genome.mutation_sigmas(cfg)
-    return fallback_mutation_sigmas(cfg)
 
 
 def theta_repro(creature: C.CreatureArena, cfg: Config) -> jax.Array:
@@ -201,9 +178,11 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     success_rank = jnp.cumsum(success.astype(jnp.int32)) - 1
     child_slots = free_slots[jnp.clip(success_rank, 0, capacity - 1)]
 
-    # Child genome mutation (§6.3) and heading.
-    sigma = mutation_sigmas(cfg)
-    noise = jax.random.normal(key_noise, (capacity, int(cfg.brain.genome_dim)), dtype=jnp.float32)
+    # Child genome mutation (§6.3) and heading.  The genome width is the brain
+    # layout's derived total, not a configured number.
+    lay = brain_genome.layout(cfg)
+    sigma = brain_genome.mutation_sigmas(cfg)
+    noise = jax.random.normal(key_noise, (capacity, lay.total), dtype=jnp.float32)
     child_genome = creature.genome.g + noise * sigma[None, :]
     child_heading = jax.random.uniform(
         key_theta, (capacity,), dtype=jnp.float32, minval=-jnp.pi, maxval=jnp.pi
@@ -309,16 +288,14 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     )
     genome = C.Genome(g=_scatter_rows(creature.genome.g, child_slots, success, child_genome))
     zero_brain = C.BrainState.zeros(
-        capacity, cfg.brain.h, state.slice.shape[1], cfg.brain.plastic_dim
+        capacity, cfg.brain.h, state.slice.shape[1], lay.plastic_dim
     )
     brain = C.BrainState(
         h=_scatter_rows(creature.brain.h, child_slots, success, zero_brain.h),
         s_hat=_scatter_rows(creature.brain.s_hat, child_slots, success, zero_brain.s_hat),
         w_fast=_scatter_rows(creature.brain.w_fast, child_slots, success, zero_brain.w_fast),
-        last_pre=_scatter_rows(creature.brain.last_pre, child_slots, success, zero_brain.last_pre),
-        last_post=_scatter_rows(
-            creature.brain.last_post, child_slots, success, zero_brain.last_post
-        ),
+        e=_scatter_rows(creature.brain.e, child_slots, success, zero_brain.e),
+        h_prev=_scatter_rows(creature.brain.h_prev, child_slots, success, zero_brain.h_prev),
     )
     zero_grip = C.Grip.zeros(capacity)
     grip = C.Grip(
@@ -372,7 +349,8 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
     motor = C.Motor(
         last_out=_scatter_rows(
             creature.motor.last_out, child_slots, success, zero_motor.last_out
-        )
+        ),
+        u_eff=_scatter_rows(creature.motor.u_eff, child_slots, success, zero_motor.u_eff),
     )
     zero_focal = C.Focal.zeros(capacity)
     focal = C.Focal(
@@ -400,10 +378,14 @@ def _split(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuff
         motor=motor,
         focal=focal,
     )
+    # §3.5: the 0.02*rho_parent birth loss leaves the nutrient book; the tissue
+    # and reserve payments to the child are internal transfers.
+    birth_outflow = jnp.sum(jnp.where(success[:, None], birth_loss, 0.0), axis=0)
     state = update(
         state,
         entities=update(ents, creature=creature),
         uid_counter=state.uid_counter + jnp.sum(success).astype(jnp.int32),
+        ledger=add_outflow(state.ledger, C.OUTFLOW_BIRTH_LOSS, birth_outflow),
     )
 
     # Every eligible parent reports either a birth or a failure (§5.5).

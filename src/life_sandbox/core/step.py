@@ -4,21 +4,26 @@ Every system is a pure function apply(state, cfg) -> (state, events).  The
 system order is fixed by the specification and never by configuration; only
 capability switches inside a system may change.
 
-Events are a step output (documented decision): they are not stored in the
-world state, so they never enter the state hash or a snapshot.
+Events and the nutrient ledger are step outputs: the production scan emits both
+per tick, so the host can write events and sum flows in float64 without ever
+storing them in the world state (SANDBOX.md §3.3, §3.5).  The ledger draft area
+inside WorldState is cleared at the start of every tick and is returned as a
+scan output; nothing accumulates across ticks inside the state.
 """
 
 from __future__ import annotations
 
-from typing import Callable
-
 import functools
+from dataclasses import dataclass, field
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from life_sandbox.config import Config
-from life_sandbox.core import events
+from life_sandbox.core import components as C
+from life_sandbox.core import events, masks
 from life_sandbox.core.state import WorldState
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems import (
@@ -65,9 +70,12 @@ SYSTEMS: tuple[tuple[str, SystemFn], ...] = (
     ("die", death.apply),
 )
 
+LEDGER_FIELDS: tuple[str, ...] = ("inflow", "outflow", "transfer_from", "transfer_to", "digested")
+
 
 def step(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffer]:
-    """Advance one tick: run every system in the fixed order, then advance the clock."""
+    """Advance one tick: clear the ledger, run every system in order, advance the clock."""
+    state = update(state, ledger=C.Ledger.zeros())
     buffer = events.empty(cfg)
     for _, system in SYSTEMS:
         state, produced = system(state, cfg)
@@ -84,17 +92,20 @@ def _event_counts(buffer: events.EventBuffer) -> jax.Array:
     return counts.astype(jnp.int32)
 
 
-def _scan_run(state: WorldState, cfg: Config, ticks: int) -> tuple[WorldState, jax.Array]:
+def _scan_run(
+    state: WorldState, cfg: Config, ticks: int
+) -> tuple[WorldState, jax.Array, events.EventBuffer, C.Ledger]:
     """Chunked run: K ticks compiled into one lax.scan segment (SANDBOX.md §3.3)."""
 
     def body(carry, _):
         current, totals = carry
         current, buffer = step(current, cfg)
-        return (current, totals + _event_counts(buffer)), None
+        outputs = (buffer, current.ledger)
+        return (current, totals + _event_counts(buffer)), outputs
 
     initial = jnp.zeros(len(events.EVENT_KINDS), dtype=jnp.int32)
-    (state, totals), _ = jax.lax.scan(body, (state, initial), None, length=ticks)
-    return state, totals
+    (state, totals), (buffers, ledgers) = jax.lax.scan(body, (state, initial), None, length=ticks)
+    return state, totals, buffers, ledgers
 
 
 # Production chunks ticks into segments so each segment compiles once and the
@@ -112,35 +123,144 @@ def _compiled_segment(cfg: Config, ticks: int):
     return jax.jit(_run)
 
 
+def _zero_ledger_totals() -> dict[str, np.ndarray]:
+    return {
+        "inflow": np.zeros((C.N_INFLOW_CATEGORIES, C.N_NUTRIENTS), dtype=np.float64),
+        "outflow": np.zeros((C.N_OUTFLOW_CATEGORIES, C.N_NUTRIENTS), dtype=np.float64),
+        "transfer_from": np.zeros(C.N_NUTRIENTS, dtype=np.float64),
+        "transfer_to": np.zeros(C.N_NUTRIENTS, dtype=np.float64),
+        "digested": np.zeros(C.N_NUTRIENTS, dtype=np.float64),
+    }
+
+
+def _accumulate_ledger(totals: dict[str, np.ndarray], ledger, axis: int | None) -> None:
+    for name in LEDGER_FIELDS:
+        values = np.asarray(getattr(ledger, name), dtype=np.float64)
+        totals[name] += values.sum(axis=0) if axis is not None else values
+
+
+def _event_table(buffers: events.EventBuffer) -> dict[str, np.ndarray]:
+    """Flatten a stacked per-tick buffer into numpy event columns."""
+    counts = np.asarray(buffers.count, dtype=np.int64)
+    capacity = buffers.kind.shape[1]
+    mask = np.arange(capacity)[None, :] < counts[:, None]
+    table: dict[str, np.ndarray] = {}
+    for name in events._ARRAY_FIELDS:
+        table[name] = np.asarray(getattr(buffers, name))[mask]
+    table["dropped"] = np.asarray(buffers.dropped, dtype=np.int64).sum(keepdims=False)
+    return table
+
+
+def _stack_buffers(buffers: list[events.EventBuffer]) -> events.EventBuffer:
+    stacked = {}
+    for name in ("count", "dropped") + events._ARRAY_FIELDS:
+        stacked[name] = np.stack([np.asarray(getattr(buffer, name)) for buffer in buffers])
+    return events.EventBuffer(**stacked)
+
+
+def _merge_event_tables(target: dict[str, np.ndarray] | None, table: dict[str, np.ndarray]) -> None:
+    if target is None:
+        return
+    for name, values in table.items():
+        if name == "dropped":
+            continue
+        if name in target:
+            target[name] = np.concatenate([target[name], values], axis=0)
+        else:
+            target[name] = values
+
+
+@dataclass
+class RunResult:
+    """Host-side result of one run segment loop.
+
+    counts: events per kind; inflow/outflow/... are float64 sums of the per-tick
+    ledger; events is the flattened event table when collect_events=True.
+    """
+
+    state: WorldState
+    counts: dict[str, int]
+    ticks: int
+    inflow: np.ndarray
+    outflow: np.ndarray
+    transfer_from: np.ndarray
+    transfer_to: np.ndarray
+    digested: np.ndarray
+    dropped_events: int = 0
+    events: dict[str, np.ndarray] | None = field(default=None)
+
+    def event_count(self) -> int:
+        if self.events is None or "uid" not in self.events:
+            return 0
+        return int(self.events["uid"].shape[0])
+
+
 def run(
     state: WorldState,
     cfg: Config,
     ticks: int,
     *,
     compile: bool = True,
-    segment: int = DEFAULT_SEGMENT_TICKS,
-) -> tuple[WorldState, dict[str, int]]:
-    """Run ticks and return the final state plus event counts by kind.
+    segment: int | None = None,
+    collect_events: bool = False,
+) -> RunResult:
+    """Run ticks and return the final state, event counts, ledger totals and events.
 
     compile=True runs the production path: fixed-length lax.scan segments that
-    compile once and are reused; compile=False is the eager reference.
+    compile once and are reused; compile=False is the eager reference.  Both
+    paths return the per-tick events and ledger, so the production path no
+    longer drops events.
     """
     ticks = int(ticks)
-    if ticks <= 0:
-        return state, {}
+    segment = int(cfg.run.segment_ticks) if segment is None else int(segment)
+    totals = _zero_ledger_totals()
+    counts: dict[str, int] = {}
+    event_table: dict[str, np.ndarray] | None = {} if collect_events else None
+    dropped = 0
+
+    def add_counts(values) -> None:
+        for index, name in enumerate(events.EVENT_KINDS):
+            value = int(values[index])
+            if value:
+                counts[name] = counts.get(name, 0) + value
+
     if compile:
-        totals = jnp.zeros(len(events.EVENT_KINDS), dtype=jnp.int32)
         remaining = ticks
         while remaining > 0:
             size = min(int(segment), remaining)
-            state, part = _compiled_segment(cfg, size)(state)
-            totals = totals + part
+            state, counts_vec, buffers, ledgers = _compiled_segment(cfg, size)(state)
+            add_counts(counts_vec)
+            _accumulate_ledger(totals, ledgers, axis=0)
+            dropped += int(np.asarray(buffers.dropped).sum())
+            _merge_event_tables(event_table, _event_table(buffers))
             remaining -= size
-        values = {name: int(totals[i]) for i, name in enumerate(events.EVENT_KINDS)}
+            masks.ensure_uid_headroom(state.uid_counter)
     else:
-        values = {}
+        eager_buffers: list[events.EventBuffer] = []
         for _ in range(ticks):
             state, buffer = step(state, cfg)
-            for name, value in events.summary(buffer).items():
-                values[name] = values.get(name, 0) + value
-    return state, {name: value for name, value in values.items() if value}
+            masks.ensure_uid_headroom(state.uid_counter)
+            add_counts(
+                np.asarray([events.summary(buffer).get(name, 0) for name in events.EVENT_KINDS])
+            )
+            _accumulate_ledger(totals, state.ledger, axis=None)
+            dropped += int(np.asarray(buffer.dropped))
+            if event_table is not None:
+                eager_buffers.append(buffer)
+        if event_table is not None and eager_buffers:
+            _merge_event_tables(event_table, _event_table(_stack_buffers(eager_buffers)))
+    if event_table is not None:
+        event_table["dropped"] = np.asarray(dropped, dtype=np.int64)
+
+    return RunResult(
+        state=state,
+        counts=counts,
+        ticks=ticks,
+        inflow=totals["inflow"],
+        outflow=totals["outflow"],
+        transfer_from=totals["transfer_from"],
+        transfer_to=totals["transfer_to"],
+        digested=totals["digested"],
+        dropped_events=dropped,
+        events=event_table,
+    )

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 
+from life_sandbox.brain.genome import layout
 from life_sandbox.config import Capacities, Config, RunConfig, WorldConfig
+from life_sandbox.core import components as C
 from life_sandbox.core.hashing import state_hash
 from life_sandbox.core.state import population
+from life_sandbox.world import constants as K
 from life_sandbox.world.init import initial_state
 
 
@@ -35,6 +38,24 @@ def test_initial_population_and_uids(tiny_cfg):
         ]
     )
     assert sorted(int(u) for u in all_uids) == list(range(11))
+
+
+def test_widths_follow_the_brain_layout(tiny_cfg):
+    lay = layout(tiny_cfg)
+    state = initial_state(tiny_cfg)
+    creature = state.entities.creature
+    assert creature.genome.g.shape[1] == lay.total
+    assert creature.brain.w_fast.shape[1] == lay.plastic_dim
+    assert creature.brain.e.shape[1] == lay.d
+    assert creature.brain.h_prev.shape[1] == tiny_cfg.brain.h
+    assert state.pain_weights.shape == (C.N_PAIN_SOURCES, C.N_PAIN_CHANNELS)
+
+
+def test_founder_tissue_follows_the_growth_rule(tiny_cfg):
+    state = initial_state(tiny_cfg)
+    expected = K.ADULT_TISSUE_FRACTION * jnp.asarray(K.FLESH_COMP)
+    assert jnp.allclose(state.entities.creature.body.B[0], expected)
+    assert K.ADULT_TISSUE_FRACTION == 0.03 + 0.1 * (1.0 - 0.3)
 
 
 def test_initial_state_is_deterministic_and_seed_sensitive(tiny_cfg):

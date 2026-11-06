@@ -4,6 +4,11 @@ The shared header lives in core/genome.py: diet logits [0:3], colour [3:6],
 odour [6:6+C_o], theta_repro at 6+C_o.  Brain-specific blocks start at
 core.genome.brain_base(odor_channels) = 7+C_o (same file).
 
+Genome width and fast-weight width are derived from the layout, never from
+configuration: GenomeLayout.genome_dim == GenomeLayout.total and
+GenomeLayout.plastic_dim == H*D + H*H + N_OUT*H + D*H.  Changing H, D, M or the
+slice width therefore moves every downstream array automatically (SANDBOX 6.3).
+
 Block order (absolute indices into Genome.g, every block float32):
 
     block       size        row-major layout
@@ -41,8 +46,8 @@ D is the slice width.  cfg.learning.readable_leak opens the leak arm of
 SANDBOX.md 5.6, which appends 5 designer dimensions to the slice; the
 caller (think/learn) passes the actual width of state.slice so a jitted system
 never disagrees with the traced array.  Widening D moves the later block offsets
-and grows the fast weights, so such an arm must also raise cfg.brain.genome_dim
-and cfg.brain.plastic_dim (out of M0 scope; the guard below reports it).
+and grows the fast weights, so such an arm needs a wider layout (out of M0
+scope; readable_leak is rejected by Config.validate until M3).
 
 The sleep-consolidation rate rho_j (ARCHITECTURES.md 3.4, phase 2b) is not part
 of the M0 genome; it will be appended as a new block when consolidation lands,
@@ -53,9 +58,9 @@ genome entry near 0 therefore decodes to a rate near 1.  The founder init and
 the M1/M2 calibration own the distribution of those log entries, not this
 decoder.
 
-W_fast (BrainState.w_fast, cfg.brain.plastic_dim slots) holds only the four
+W_fast (BrainState.w_fast, layout.plastic_dim slots) holds only the four
 plastic matrices, in this order: w_in, w_rec, w_out, w_pred.  Their sizes sum
-to cfg.brain.plastic_dim (H*D + H*H + N_OUT*H + D*H).
+to layout.plastic_dim (H*D + H*H + N_OUT*H + D*H).
 
 mutation_sigmas(cfg) returns the per-block mutation scale used by reproduction
 (SANDBOX.md 6.3): genome blocks mutate with g' = g + sigma_block * N(0, 1).
@@ -117,6 +122,11 @@ class GenomeLayout:
     total: int
     plastic_dim: int
 
+    @property
+    def genome_dim(self) -> int:
+        """Total genome width implied by this layout (shared header included)."""
+        return self.total
+
     def block_sizes(self) -> dict[str, int]:
         """Size in genome slots of every brain block (for tests and diagnostics)."""
         names = (
@@ -153,13 +163,16 @@ def config_slice_dim(cfg) -> int:
 
 
 def layout(cfg, slice_dim: int | None = None) -> GenomeLayout:
-    """Resolve the brain genome layout and check it fits cfg.brain.genome_dim.
+    """Resolve the brain genome layout; its widths are the derived truth.
 
     'slice_dim' overrides the config-derived slice width; think/learn pass
     state.slice.shape[1] so the decoded W_in/W_err/w_pred always match the array
-    they multiply, even under jit.  Raises ValueError when the blocks would
-    overflow the genome or when cfg.brain.plastic_dim disagrees with the
-    fast-weight layout.
+    they multiply, even under jit.  Genome and fast-weight widths are NOT
+    configured: they follow from H, D, M and N_OUT (SANDBOX.md §6.3), so a
+    change of D moves every array automatically.
+
+    GenomeLayout.genome_dim (== total) is the genome width and
+    GenomeLayout.plastic_dim the BrainState.w_fast width for this config.
 
     The arithmetic is cached on static config values (lru_cache): think/learn
     call this on every tick, and under lax.scan the call happens once per trace,
@@ -171,8 +184,6 @@ def layout(cfg, slice_dim: int | None = None) -> GenomeLayout:
         int(cfg.brain.modulators),
         C.N_OUTPUTS,
         core_genome.brain_base(int(cfg.sensors.odor_channels)),
-        int(cfg.brain.genome_dim),
-        int(cfg.brain.plastic_dim),
     )
 
 
@@ -183,10 +194,8 @@ def _layout_cached(
     m: int,
     n_out: int,
     base: int,
-    genome_dim: int,
-    plastic_dim: int,
 ) -> GenomeLayout:
-    """Build and validate one layout from static integers (see layout())."""
+    """Build one layout from static integers (see layout())."""
     if h <= 0 or d <= 0 or m <= 0 or n_out <= 0:
         raise ValueError("brain genome needs positive H, D, M and output count")
     post = h + n_out
@@ -216,29 +225,8 @@ def _layout_cached(
     log_eta_p = take(1)
     total = cursor
 
+    # Fast-weight width: W_in + W_rec + W_out + W_pred (SANDBOX.md §6.5).
     layout_plastic_dim = h * d + h * h + n_out * h + d * h
-    if layout_plastic_dim != plastic_dim:
-        raise ValueError(
-            "cfg.brain.plastic_dim="
-            + str(plastic_dim)
-            + " does not match the B0 fast-weight layout "
-            + str(layout_plastic_dim)
-            + " (H*D + H*H + N_OUT*H + D*H; D="
-            + str(d)
-            + ")"
-        )
-    if total > genome_dim:
-        raise ValueError(
-            "brain genome needs "
-            + str(total)
-            + " slots (shared header "
-            + str(base)
-            + " + brain blocks "
-            + str(total - base)
-            + ") but cfg.brain.genome_dim is "
-            + str(genome_dim)
-            + "; raise genome_dim or trim the layout (SANDBOX.md 6.3)"
-        )
     return GenomeLayout(
         h=h,
         d=d,
@@ -260,19 +248,17 @@ def _layout_cached(
         hebb=hebb,
         log_eta_p=log_eta_p,
         total=total,
-        plastic_dim=plastic_dim,
+        plastic_dim=layout_plastic_dim,
     )
 
 
-def _check_genome(cfg, genome: jax.Array) -> None:
+def _check_genome(cfg, genome: jax.Array, lay: GenomeLayout | None = None) -> None:
     if genome.ndim != 2:
         raise ValueError("genome must be (N, genome_dim), got ndim " + str(genome.ndim))
-    if genome.shape[1] != int(cfg.brain.genome_dim):
+    expected = layout(cfg).total if lay is None else lay.total
+    if genome.shape[1] != expected:
         raise ValueError(
-            "genome width "
-            + str(genome.shape[1])
-            + " does not match cfg.brain.genome_dim "
-            + str(cfg.brain.genome_dim)
+            "genome width " + str(genome.shape[1]) + " does not match the B0 layout " + str(expected)
         )
 
 
@@ -283,12 +269,12 @@ def decode_slow(
 ) -> SlowWeights:
     """Decode W_slow and the biases of B0 from the genome (SANDBOX.md 6.1).
 
-    'genome' has shape (N, genome_dim); every block is read row-major with the
-    layout documented at the top of this module.  The values are used as-is:
-    founder init and mutation own the scale (SANDBOX.md 6.3).
+    'genome' has shape (N, layout.genome_dim); every block is read row-major
+    with the layout documented at the top of this module.  The values are used
+    as-is: founder init and mutation own the scale (SANDBOX.md 6.3).
     """
-    _check_genome(cfg, genome)
     lay = layout(cfg) if lay is None else lay
+    _check_genome(cfg, genome, lay)
     n = genome.shape[0]
     return SlowWeights(
         w_in=genome[:, lay.w_in].reshape(n, lay.h, lay.d),
@@ -313,8 +299,8 @@ def decode_plastic(
     eta_j = exp(log_eta_j), lambda_j = exp(log_lambda_j) and
     eta_p = exp(log_eta_p), per SANDBOX.md 6.3 ("stored as logs").
     """
-    _check_genome(cfg, genome)
     lay = layout(cfg) if lay is None else lay
+    _check_genome(cfg, genome, lay)
     n = genome.shape[0]
     return PlasticParams(
         eta=jnp.exp(genome[:, lay.log_eta]),
@@ -367,14 +353,16 @@ def join_fast(fast: FastWeights, lay: GenomeLayout) -> jax.Array:
 def mutation_sigmas(cfg) -> jax.Array:
     """Per-slot mutation scale for the whole genome (SANDBOX.md 6.3).
 
-    Returns float32[cfg.brain.genome_dim].  Mutation is g' = g + sigma * N(0, 1)
-    with one sigma per block (SANDBOX.md 6.3): shared header traits 0.05 except
-    theta_repro 0.02; weight-like brain blocks 0.02; log eta/lambda/eta_p 0.1.
-    Slots past the end of the actual layout keep the default 0.02 so a future
-    appended block (e.g. log rho in phase 2b) mutates with the weight scale.
+    Returns float32[layout(cfg).genome_dim] -- exactly the derived genome width,
+    so mutation and genome arrays never disagree.  Mutation is
+    g' = g + sigma * N(0, 1) with one sigma per block (SANDBOX.md 6.3): shared
+    header traits 0.05 except theta_repro 0.02; weight-like brain blocks 0.02;
+    log eta/lambda/eta_p 0.1.  When a block is appended later (e.g. log rho in
+    phase 2b) the layout and this array grow together and the new block picks
+    its own scale.
     """
     lay = layout(cfg)
-    sigma = jnp.full((int(cfg.brain.genome_dim),), SIGMA_WEIGHT, dtype=jnp.float32)
+    sigma = jnp.full((int(lay.total),), SIGMA_WEIGHT, dtype=jnp.float32)
     # Shared header (core/genome.py owns the offsets).
     odor_channels = int(cfg.sensors.odor_channels)
     theta = core_genome.theta_repro_index(odor_channels)

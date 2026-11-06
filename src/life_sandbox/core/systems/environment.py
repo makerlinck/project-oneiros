@@ -6,11 +6,13 @@ What one tick does, in this fixed order:
 
 1. Berry regeneration (§4.2): stock += 0.03*stock*(1 - stock) + 1e-4, clipped to
    [0, 1] because stock is a fraction with that range.
-2. Carcass rot (§4.2): 0.5% of plant and animal matter becomes toxin every tick;
-   a carcass is removed once it is older than 600 ticks or its nutrients are
-   exhausted.  Removed carcasses keep their numbers (alive = False) so the
-   accounting layer can book the leftover mass as decomposition (§3.5); this
-   system never touches the ledger.
+2. Carcass rot (§4.2): 0.5% of plant and animal matter becomes toxin every tick.
+   The conversion is an internal transfer in the nutrient book (§3.5), so it is
+   recorded as ledger.transfer_from = [rotP, rotA, 0] and
+   ledger.transfer_to = [0, 0, rotP + rotA].  A carcass is removed once it is
+   older than 600 ticks or its nutrients are exhausted; its remaining n (this
+   tick's post-rot value, kept unchanged in the dead slot) is booked as
+   outflow[OUTFLOW_DECOMPOSITION], so the dead slot never silently drops mass.
 3. Toxin schedule (§4.4): every T_switch = c_switch * L ticks (L = world.l_ticks,
    an M1 calibration output) the environment key picks one berry species; its
    composition becomes 0.6 * base + 0.4 * toxin and every other species returns
@@ -32,11 +34,17 @@ import jax.numpy as jnp
 
 from life_sandbox.config import Config
 from life_sandbox.core import events, masks, rng
-from life_sandbox.core.components import BushArena, CarcassArena, NeutralArena
+from life_sandbox.core.components import (
+    OUTFLOW_DECOMPOSITION,
+    BushArena,
+    CarcassArena,
+    NeutralArena,
+)
 from life_sandbox.core.events import kind_code
+from life_sandbox.core.ledger import add_outflow, add_transfer
 from life_sandbox.core.state import WorldState
 from life_sandbox.core.struct import update
-from life_sandbox.world.constants import INITIAL_COMP
+from life_sandbox.world.constants import BERRY_RGB, BUSH_GREEN, INITIAL_COMP
 
 # Berry regeneration coefficients (§4.2).
 BERRY_GROWTH: float = 0.03
@@ -66,29 +74,65 @@ def berry_growth(arena: BushArena) -> BushArena:
     return update(arena, edible=update(arena.edible, stock=stock))
 
 
-def carcass_rot(arena: CarcassArena) -> CarcassArena:
-    """Age carcasses, move 0.5% of their plant/animal mass into toxin (§4.2)."""
+def bush_appearance(arena: BushArena) -> BushArena:
+    """Mix green with the species berry colour by stock (§4.2).
+
+    rgb = BUSH_GREEN * (1 - stock) + BERRY_RGB[kind] * stock; dead slots keep
+    their stored colour.  Odour is untouched here: the odour deposit already
+    uses the species spectrum x stock in world/fields.py (§4.3).
+    """
+    kind = jnp.clip(arena.edible.kind, 0, len(BERRY_RGB) - 1)
+    berry = jnp.asarray(BERRY_RGB, jnp.float32)[kind]
+    green = jnp.asarray(BUSH_GREEN, jnp.float32)[None, :]
+    stock = arena.edible.stock[:, None]
+    rgb = green * (1.0 - stock) + berry * stock
+    rgb = jnp.where(arena.alive[:, None], rgb, arena.look.rgb)
+    return update(arena, look=update(arena.look, rgb=rgb))
+
+
+def carcass_rot(arena: CarcassArena) -> tuple[CarcassArena, jax.Array, jax.Array]:
+    """Age carcasses, move 0.5% of their plant/animal mass into toxin (§4.2).
+
+    Returns (arena, rot_from, decomposition) where rot_from is the per-nutrient
+    internal transfer [rotP, rotA, 0] of this tick and decomposition is the
+    per-nutrient n of every carcass removed by this tick.  The removed slots
+    keep their n (alive = False only): the ledger records the mass crossing the
+    book boundary, not a second copy in the state (§3.5).
+    """
     nun = arena.edible.n
+    alive = arena.alive
     plant = nun[:, 0]
     animal = nun[:, 1]
-    rot = CARCASS_ROT * (plant + animal)
+    rot_plant = CARCASS_ROT * plant
+    rot_animal = CARCASS_ROT * animal
     updated = jnp.stack(
         [
-            plant - CARCASS_ROT * plant,
-            animal - CARCASS_ROT * animal,
-            nun[:, 2] + rot,
+            plant - rot_plant,
+            animal - rot_animal,
+            nun[:, 2] + rot_plant + rot_animal,
         ],
         axis=-1,
     )
-    updated = jnp.where(arena.alive[:, None], updated, nun)
-    age = jnp.where(arena.alive, arena.edible.age_dead + 1, arena.edible.age_dead)
+    updated = jnp.where(alive[:, None], updated, nun)
+    age = jnp.where(alive, arena.edible.age_dead + 1, arena.edible.age_dead)
     empty = jnp.sum(updated, axis=-1) <= _EMPTY_EPS
-    alive = arena.alive & (age <= CARCASS_MAX_AGE) & ~empty
-    return update(
+    alive_after = alive & (age <= CARCASS_MAX_AGE) & ~empty
+    removed = alive & ~alive_after
+
+    rot_from = jnp.stack(
+        [
+            jnp.sum(jnp.where(alive, rot_plant, 0.0)),
+            jnp.sum(jnp.where(alive, rot_animal, 0.0)),
+            jnp.asarray(0.0, jnp.float32),
+        ]
+    ).astype(jnp.float32)
+    decomposition = jnp.sum(jnp.where(removed[:, None], updated, 0.0), axis=0)
+    arena = update(
         arena,
-        alive=alive,
+        alive=alive_after,
         edible=update(arena.edible, n=updated, age_dead=age),
     )
+    return arena, rot_from, decomposition.astype(jnp.float32)
 
 
 def toxin_composition(
@@ -167,13 +211,17 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     key = rng.system_key(state.key, state.tick, "environment")
     switch_key, wander_key = rng.subsplit(key, 2)
 
-    entities = update(
-        state.entities,
-        bush=berry_growth(state.entities.bush),
-        carcass=carcass_rot(state.entities.carcass),
-    )
+    bush = bush_appearance(berry_growth(state.entities.bush))
+    carcass, rot_from, decomposition = carcass_rot(state.entities.carcass)
+    entities = update(state.entities, bush=bush, carcass=carcass)
     entities = update(entities, neutral=neutral_wander(entities, cfg, wander_key))
     comp, chosen, switch_now = toxin_composition(state, cfg, switch_key)
+
+    # Internal transfer (plant/animal -> toxin) and the mass leaving the book
+    # when a carcass is removed (§3.5).
+    rot_to = jnp.asarray([0.0, 0.0, rot_from[0] + rot_from[1]], jnp.float32)
+    ledger = add_transfer(state.ledger, from_amount=rot_from, to_amount=rot_to)
+    ledger = add_outflow(ledger, OUTFLOW_DECOMPOSITION, decomposition)
 
     event = events.append(
         events.empty(cfg),
@@ -187,4 +235,4 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
     event = update(event, count=jnp.where(switch_now, jnp.int32(1), jnp.int32(0)))
     buffer = events.concat(events.empty(cfg), event)
 
-    return update(state, entities=entities, comp=comp), buffer
+    return update(state, entities=entities, comp=comp, ledger=ledger), buffer

@@ -58,6 +58,7 @@ def add_creature(
     stomach=(0.0, 0.0, 0.0),
     reserves=(0.0, 0.0, 0.0),
     out=None,
+    eff=None,
 ):
     cfg = small_cfg()
     cre = state.entities.creature
@@ -84,6 +85,10 @@ def add_creature(
     motor = cre.motor
     if out is not None:
         motor = update(motor, last_out=motor.last_out.at[slot].set(out))
+    if eff is not None:
+        motor = update(
+            motor, u_eff=motor.u_eff.at[slot].set(jnp.asarray(eff, jnp.float32))
+        )
     cre = update(
         cre,
         alive=cre.alive.at[slot].set(True),
@@ -228,6 +233,8 @@ def test_bite_bush_takes_berry_mass():
     assert len(bites) == 1 and bites[0]["target_kind"] == C.BUSH
     assert bites[0]["success"] and bites[0]["target_uid"] == 100
     assert jnp.allclose(jnp.asarray(bites[0]["dn"]), expected, atol=1e-6)
+    # §3.5: the bush bite is the nutrient-book inflow.
+    assert jnp.allclose(out.ledger.inflow[C.INFLOW_BITES], expected, atol=1e-6)
 
 
 def test_bite_inside_bush_ignores_angle():
@@ -261,6 +268,8 @@ def test_bite_carcass_takes_proportional_nutrients():
     bites = of_kind(buffer, "bite")
     assert len(bites) == 1 and bites[0]["target_kind"] == C.CARCASS
     assert bites[0]["damage"] == 0.0
+    # Bites on carcasses are internal transfers, not inflow (§3.5).
+    assert float(jnp.sum(out.ledger.inflow[C.INFLOW_BITES])) == 0.0
 
 
 # -------------------------------------------------------- bite: living target
@@ -280,6 +289,7 @@ def test_bite_living_target_damages_and_feeds():
     bites = of_kind(buffer, "bite")
     assert len(bites) == 1 and bites[0]["target_kind"] == C.CREATURE
     assert bites[0]["damage"] == pytest.approx(0.1, abs=1e-6)
+    assert float(jnp.sum(out.ledger.inflow[C.INFLOW_BITES])) == 0.0
 
 
 def test_bite_neutral_has_no_effect():
@@ -396,7 +406,7 @@ def test_grab_living_succeeds_when_not_escaping():
 def test_grab_living_fails_when_target_escapes():
     """The grab target resists with the escape rule (§5.4)."""
     cfg = small_cfg()
-    state = add_creature(empty(cfg), 1, pos=(11.0, 10.0), mass=1.0, out=output_row(acc=1.0))
+    state = add_creature(empty(cfg), 1, pos=(11.0, 10.0), mass=1.0, eff=(1.0, 0.0))
     state = add_creature(state, 0, out=output_row(grab=1.0))
     out, buffer = interaction.apply(state, cfg)
     grabs = of_kind(buffer, "grab")
@@ -447,7 +457,7 @@ def test_grab_does_not_target_bushes():
 def test_held_creature_escapes():
     """Escape rule: |u'_acc|*a_max > 0.03*(1+k_holder)*g_holder (§5.4)."""
     cfg = small_cfg()
-    state = add_creature(empty(cfg), 0, out=output_row(acc=1.0))
+    state = add_creature(empty(cfg), 0, eff=(1.0, 0.0))
     state = add_creature(state, 1, pos=(9.0, 10.0))
     state = set_holding(state, 1, C.CREATURE, 0, 1)
     state = set_held_by(state, "creature", 0, holder_slot=1, holder_uid=2)
@@ -460,13 +470,34 @@ def test_held_creature_escapes():
 
 def test_held_creature_cannot_escape_without_thrust():
     cfg = small_cfg()
-    state = add_creature(empty(cfg), 0)
+    # Intended output is high but the effective control is zero: no escape.
+    state = add_creature(empty(cfg), 0, out=output_row(acc=1.0), eff=(0.0, 0.0))
     state = add_creature(state, 1, pos=(9.0, 10.0))
     state = set_holding(state, 1, C.CREATURE, 0, 1)
     state = set_held_by(state, "creature", 0, holder_slot=1, holder_uid=2)
     out, buffer = interaction.apply(state, cfg)
     assert len(of_kind(buffer, "escape")) == 0
     assert int(out.entities.creature.grip.held_by.kind[0]) == C.CREATURE
+
+
+def test_escape_reads_effective_control_not_intended_output():
+    """The escape rule uses Motor.u_eff[0], never the raw intended u_acc (§5.4)."""
+    cfg = small_cfg()
+    # High intended output, zero effective control -> remains held.
+    kept = add_creature(empty(cfg), 0, out=output_row(acc=1.0), eff=(0.0, 0.0))
+    kept = add_creature(kept, 1, pos=(9.0, 10.0))
+    kept = set_holding(kept, 1, C.CREATURE, 0, 1)
+    kept = set_held_by(kept, "creature", 0, holder_slot=1, holder_uid=2)
+    _, kept_buffer = interaction.apply(kept, cfg)
+    assert len(of_kind(kept_buffer, "escape")) == 0
+
+    # Zero intended output, high effective control -> escapes.
+    freed = add_creature(empty(cfg), 0, out=output_row(acc=0.0), eff=(1.0, 0.0))
+    freed = add_creature(freed, 1, pos=(9.0, 10.0))
+    freed = set_holding(freed, 1, C.CREATURE, 0, 1)
+    freed = set_held_by(freed, "creature", 0, holder_slot=1, holder_uid=2)
+    _, freed_buffer = interaction.apply(freed, cfg)
+    assert len(of_kind(freed_buffer, "escape")) == 1
 
 
 def test_drop_releases_held_entity():
