@@ -33,6 +33,7 @@ import numpy as np
 from life_sandbox.config import BrainConfig, Capacities, Config, LearningConfig, RunConfig, WorldConfig
 from life_sandbox.core import components as C
 from life_sandbox.core import events as events_mod
+from life_sandbox.core import ramp as ramp_mod
 from life_sandbox.core.state import population
 from life_sandbox.core.step import SYSTEMS, _event_counts, step as engine_step
 from life_sandbox.core.systems import reproduction as reproduction_system
@@ -119,8 +120,11 @@ def forager_think(state, cfg):
     diet = diet_from_genome(creature.genome.g, cfg)  # (N, 3)
     rho_animal = diet[:, C.ANIMAL]
     animal_share = state.comp[C.ANIMAL][bush.edible.kind]  # per bush slot
+    # Per-tick metabolic demand (ramp-scaled base metabolism): the animal intake
+    # at full digestion must cover 1.3x of the animal share of that demand.
+    c_tot = cfg.body.base_metabolism * ramp_mod.metabolism_multiplier(state.tick, cfg)
     supplied = 0.0135 * 0.9 * jnp.sqrt(rho_animal)[:, None] * animal_share[None, :]
-    eligible = bush.alive[None, :] & (supplied >= 1.3 * rho_animal[:, None])
+    eligible = bush.alive[None, :] & (supplied >= 1.3 * rho_animal[:, None] * c_tot)
 
     delta = bush.transform.pos[None, :, :] - pos[:, None, :]
     distance0 = jnp.where(bush.alive[None, :], jnp.linalg.norm(delta, axis=-1), jnp.inf)
