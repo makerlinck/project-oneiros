@@ -32,10 +32,6 @@ FLESH_COMP: tuple[float, float, float] = (0.3, 0.7, 0.0)
 BUSH_T_PREF: tuple[float, ...] = (-1.5, 0.0, 1.2)
 BUSH_T_SIGMA: float = 0.5
 
-# Founder diet logits: plant/animal from N(0,1), toxin from N(-3,1) (§5.1).
-FOUNDER_TOXIN_LOGIT_MEAN: float = -3.0
-FOUNDER_LOGIT_STD: float = 1.0
-
 # Bush appearance (§4.2): green mixed with the berry colour by stock.
 BUSH_RADIUS: float = 1.0
 BUSH_GREEN: tuple[float, float, float] = (0.2, 0.6, 0.2)

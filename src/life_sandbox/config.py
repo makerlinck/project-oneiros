@@ -143,6 +143,13 @@ class BodyConfig:
 
     base_metabolism: float = 0.002
     founder_reserves: float = 0.5
+    # Founder diet logits (SANDBOX.md §5.1): plant/animal N(mean, std), toxin
+    # N(toxin_mean, std).  The 2026-11-06 diagnostics showed that animal-heavy
+    # founders starve because meat only comes from carcasses/living creatures.
+    founder_plant_logit_mean: float = 0.0
+    founder_animal_logit_mean: float = 0.0
+    founder_toxin_logit_mean: float = -3.0
+    founder_logit_std: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -228,6 +235,8 @@ class Config:
             raise ValueError("body.base_metabolism must be positive")
         if not 0 < self.body.founder_reserves <= 1:
             raise ValueError("body.founder_reserves must be in (0, 1]")
+        if self.body.founder_logit_std <= 0:
+            raise ValueError("body.founder_logit_std must be positive")
         for name in (
             "ramp_berry_multiplier",
             "ramp_metabolism_multiplier",

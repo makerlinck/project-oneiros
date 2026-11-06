@@ -54,12 +54,15 @@ def random_genome(key: jax.Array, n: int, cfg: Config) -> jax.Array:
     genome = jax.random.normal(keys[0], (n, layout.total), dtype=jnp.float32) * initial_sigmas(cfg)[
         None, :
     ]
+    std = float(cfg.body.founder_logit_std)
     diet_logits = jnp.stack(
         [
-            jax.random.normal(keys[1], (n,), dtype=jnp.float32) * K.FOUNDER_LOGIT_STD,
-            jax.random.normal(keys[2], (n,), dtype=jnp.float32) * K.FOUNDER_LOGIT_STD,
-            jax.random.normal(keys[3], (n,), dtype=jnp.float32) * K.FOUNDER_LOGIT_STD
-            + K.FOUNDER_TOXIN_LOGIT_MEAN,
+            jax.random.normal(keys[1], (n,), dtype=jnp.float32) * std
+            + cfg.body.founder_plant_logit_mean,
+            jax.random.normal(keys[2], (n,), dtype=jnp.float32) * std
+            + cfg.body.founder_animal_logit_mean,
+            jax.random.normal(keys[3], (n,), dtype=jnp.float32) * std
+            + cfg.body.founder_toxin_logit_mean,
         ],
         axis=1,
     )

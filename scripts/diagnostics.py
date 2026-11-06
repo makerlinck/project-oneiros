@@ -484,6 +484,12 @@ def design_config(args) -> Config:
                 ramp_ticks=int(args.ramp_ticks),
             )
         )
+    if args.founder_animal_logit is not None:
+        cfg = cfg.replaced(
+            body=replace(
+                cfg.body, founder_animal_logit_mean=float(args.founder_animal_logit)
+            )
+        )
     if args.arm == "control":
         cfg = cfg.replaced(reproduction=cfg.reproduction.__class__(randomize_genome=True))
     cfg.validate()
@@ -504,6 +510,7 @@ def main() -> None:
     parser.add_argument("--avoid-toxin", action="store_true")
     parser.add_argument("--min-stock", type=float, default=0.0)
     parser.add_argument("--avoid-hot", type=float, default=0.0)
+    parser.add_argument("--founder-animal-logit", type=float, default=None)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -526,6 +533,7 @@ def main() -> None:
         "min_stock": MIN_STOCK,
         "avoid_hot": AVOID_HOT,
     }
+    summary["founder_animal_logit_mean"] = cfg.body.founder_animal_logit_mean
     summary["design"] = {
         "base_metabolism": cfg.body.base_metabolism,
         "bush_capacity": cfg.capacities.bush,

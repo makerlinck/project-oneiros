@@ -73,6 +73,21 @@ def test_founder_genome_follows_initial_sigmas(tiny_cfg):
         assert measured == pytest.approx(expected, rel=0.25), name
 
 
+def test_founder_diet_logits_follow_config():
+    from dataclasses import replace
+
+    cfg = Config.default().replaced(
+        capacities=Capacities(creature=64, bush=6, carcass=2, neutral=1),
+        world=WorldConfig(founders=64),
+        run=RunConfig(seed=7, ticks=0),
+    )
+    cfg = replace(cfg, body=replace(cfg.body, founder_animal_logit_mean=-1.0))
+    state = initial_state(cfg)
+    genome = np.asarray(state.entities.creature.genome.g[: cfg.world.founders])
+    assert float(genome[:, 1].mean()) == pytest.approx(-1.0, abs=0.35)
+    assert float(genome[:, 0].mean()) == pytest.approx(0.0, abs=0.35)
+
+
 def test_founder_reserves_follow_config(tiny_cfg):
     from dataclasses import replace
 
