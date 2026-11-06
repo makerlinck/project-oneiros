@@ -240,15 +240,17 @@ def _scan_chunk(step_fn, states, cfg, size: int, collect: bool):
         current, buffer = batched(current)
         totals = totals + jax.vmap(_event_counts)(buffer)
         if collect:
-            return (current, totals), (buffer,)
+            return (current, totals), (buffer, current.ledger)
         return (current, totals), None
 
     initial = jnp.zeros((states.tick.shape[0], len(events_mod.EVENT_KINDS)), dtype=jnp.int32)
     if collect:
-        (states, totals), (buffers,) = jax.lax.scan(body, (states, initial), None, length=size)
-        return states, totals, buffers
+        (states, totals), (buffers, ledgers) = jax.lax.scan(
+            body, (states, initial), None, length=size
+        )
+        return states, totals, buffers, ledgers
     (states, totals), _ = jax.lax.scan(body, (states, initial), None, length=size)
-    return states, totals, None
+    return states, totals, None, None
 
 
 def _flatten(buffers, world: int) -> dict:
@@ -283,12 +285,21 @@ def run_worlds(step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUN
         for _ in seeds
     ]
     totals = np.zeros((len(seeds), len(events_mod.EVENT_KINDS)), dtype=np.int64)
+    ledger = {
+        "inflow": np.zeros((len(seeds), C.N_INFLOW_CATEGORIES, C.N_NUTRIENTS), dtype=np.float64),
+        "outflow": np.zeros((len(seeds), C.N_OUTFLOW_CATEGORIES, C.N_NUTRIENTS), dtype=np.float64),
+        "transfer_from": np.zeros((len(seeds), C.N_NUTRIENTS), dtype=np.float64),
+        "transfer_to": np.zeros((len(seeds), C.N_NUTRIENTS), dtype=np.float64),
+        "digested": np.zeros((len(seeds), C.N_NUTRIENTS), dtype=np.float64),
+    }
     populations = []
     jitted = jax.jit(lambda current: _scan_chunk(step_fn, current, cfg, chunk, collect))
     started = time.perf_counter()
     for _ in range(ticks // chunk):
-        states, counts, buffers = jitted(states)
+        states, counts, buffers, ledgers = jitted(states)
         totals += np.asarray(counts)
+        for name in ledger:
+            ledger[name] += np.asarray(getattr(ledgers, name), dtype=np.float64).sum(axis=0)
         if collect:
             for world in range(len(seeds)):
                 columns = _flatten(buffers, world)
@@ -326,6 +337,7 @@ def run_worlds(step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUN
         "wall_seconds": round(wall, 2),
         "populations": populations,
         "counts": totals,
+        "ledger": ledger,
         "worlds": worlds,
         "states": states,
     }
@@ -443,8 +455,16 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
         for name, value in zip(events_mod.EVENT_KINDS, np.asarray(result["counts"]).sum(axis=0).tolist())
         if value
     }
+    ledger_totals = {
+        "inflow": np.asarray(result["ledger"]["inflow"]).sum(axis=0).tolist(),
+        "outflow": np.asarray(result["ledger"]["outflow"]).sum(axis=0).tolist(),
+        "transfer_from": np.asarray(result["ledger"]["transfer_from"]).sum(axis=0).tolist(),
+        "transfer_to": np.asarray(result["ledger"]["transfer_to"]).sum(axis=0).tolist(),
+        "digested": np.asarray(result["ledger"]["digested"]).sum(axis=0).tolist(),
+    }
     return {
         "event_counts": event_counts,
+        "ledger_totals": ledger_totals,
         "per_world": per_world,
         "population_final": pop[-1].tolist(),
         "population_min": pop.min(axis=0).tolist(),
