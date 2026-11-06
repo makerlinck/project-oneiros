@@ -57,6 +57,8 @@ REASONS: tuple[str, ...] = (
     "escaped",
     "no_room",
     "not_edible",
+    # A birth that came from the reseed rescue (§5.5), not from reproduction.
+    "reseed",
 )
 
 _ARRAY_FIELDS = (
@@ -74,6 +76,7 @@ _ARRAY_FIELDS = (
     "damage",
     "cause",
     "nutrient",
+    "loss",
     "success",
     "reason",
 )
@@ -111,6 +114,8 @@ class EventBuffer:
     cause: jax.Array
     # Death only: which nutrient was missing (component index, -1 = not applicable).
     nutrient: jax.Array
+    # Death only: the decaying damage-source vector at death (§5.5).
+    loss: jax.Array
     success: jax.Array
     reason: jax.Array
 
@@ -134,6 +139,7 @@ def empty(cfg) -> EventBuffer:
         damage=jnp.zeros(capacity, dtype=jnp.float32),
         cause=jnp.zeros(capacity, dtype=jnp.int8),
         nutrient=jnp.full(capacity, -1, dtype=jnp.int8),
+        loss=jnp.zeros((capacity, 5), dtype=jnp.float32),
         success=jnp.ones(capacity, dtype=jnp.bool_),
         reason=jnp.zeros(capacity, dtype=jnp.int8),
     )

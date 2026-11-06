@@ -36,6 +36,18 @@ PLANT, ANIMAL, TOXIN = range(3)
 N_NUTRIENTS: int = 3
 FLESH_COMP: tuple[float, float, float] = (0.3, 0.7, 0.0)
 
+# Decaying damage sources (SANDBOX.md §5.5).  loss[source] accumulates integrity
+# damage with an exponential decay (tau = 50 ticks); the largest decayed source
+# at death is the reported cause.
+LOSS_NUTRITION: int = 0
+LOSS_TOXIN: int = 1
+LOSS_HEAT: int = 2
+LOSS_COLD: int = 3
+LOSS_BITE: int = 4
+N_DAMAGE_SOURCES: int = 5
+LOSS_CAUSES: tuple[str, ...] = ("nutrition", "toxin", "heat", "cold", "bite")
+DAMAGE_DECAY_TAU: float = 50.0
+
 # Pain bundle channels (§5.6): nine sources mixed into four shared channels.
 # The width is a physical property of the afferent bundle, independent of the
 # odour channel count even though both are four today.
@@ -217,28 +229,29 @@ class Pain:
 @struct
 @dataclass(frozen=True)
 class Damage:
-    """Last damage source and this tick's injury (SANDBOX.md §5.5, §5.6).
+    """Decaying per-source damage ledger (SANDBOX.md §5.5).
 
-    The persistent fields (cause, source_uid, same_lineage, nutrient) survive
-    until overwritten, so the die system can report the cause.  injury is the
-    integrity damage accumulated during the current tick; metabolism turns it
-    into acute pain and then clears it.
+    loss[source] accumulates integrity damage with an exponential decay of
+    DAMAGE_DECAY_TAU ticks; the die system reports the largest decayed source.
+    It is observation-only and invisible to the agent.  injury is this tick's
+    bite damage (acute pain); the nutrient index records the last missing
+    nutrient for nutrition deaths.
     """
 
-    cause: jax.Array
     source_uid: jax.Array
     same_lineage: jax.Array
     nutrient: jax.Array
     injury: jax.Array
+    loss: jax.Array
 
     @staticmethod
     def zeros(n: int) -> "Damage":
         return Damage(
-            cause=i8(n),
             source_uid=jnp.full((n,), NO_REF, dtype=jnp.int32),
             same_lineage=boolean(n),
             nutrient=jnp.full((n,), NO_REF, dtype=jnp.int8),
             injury=f32(n),
+            loss=f32(n, N_DAMAGE_SOURCES),
         )
 
 

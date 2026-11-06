@@ -1,26 +1,27 @@
 """M1 diagnostics on the design-value world (SANDBOX §9, PRINCIPLES §5).
 
-Requested by the 2026-11-06 review:
-  forager  -- a scripted forager probe (calibration tool ONLY: it lives here,
-              is not a brain-registry entry and never appears in an experiment)
-  fixed    -- fixed arm cohort statistics, for evolvability
-  control  -- randomize-genome control cohort statistics
+Calibration tools only: the scripted forager lives here, is not a brain-registry
+entry and never appears in an experiment arm.
 
-The scripted forager walks to the nearest living bush, stays there and bites
-while the stomach is below 80% capacity.  If it keeps a population alive, the
-design-value world is energy-feasible and the failure of the fixed arm is an
-evolvability/behaviour problem rather than a world-design problem.
+Arms:
+  fixed    -- the engine's fixed arm (B0, plasticity/prediction off)
+  control  -- same with reproduction.randomize_genome = true
+  forager  -- scripted probe: nearest bush of the diet-appropriate species, stay
+              inside, bite only when the engine's nearest bite target is that
+              bush, bite force 0.5, and set the metabolic knob from the real core
+              temperature b (b > 0.3 -> 0, b < -0.5 -> 1, linear between).
 
-Outputs JSON with population trajectory, births/deaths, death causes (cause,
-missing nutrient, same-lineage bites), capacity fraction, and per-cohort
-foraging statistics (bush bites in the individual's lifetime, lifespan,
-fraction that ever fed).
+Outputs JSON with population trajectory, births grouped by origin (reproduction
+vs reseed), lifespans for both groups and for matured individuals, death causes
+with the decaying loss vector, missing nutrients, same-lineage bite deaths, and
+per-cohort foraging statistics for reproduction-born cohorts.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -35,82 +36,167 @@ from life_sandbox.core import events as events_mod
 from life_sandbox.core.state import population
 from life_sandbox.core.step import SYSTEMS, _event_counts, step as engine_step
 from life_sandbox.core.struct import update
-from life_sandbox.world import fields as world_fields
-from life_sandbox.world.init import initial_state
+from life_sandbox.world.init import diet_from_genome, initial_state
 
 CHUNK = 128
-KNOB = 0.5  # scripted forager metabolic knob; CLI override for the temperature probe
+A_MATURE = 100
+KNOB = 0.5
+KNOB_MODE = "true-b"
+BITE_FORCE = 0.5
+AVOID_TOXIN = False
+MIN_STOCK = 0.0
+AVOID_HOT = 0.0
 
 
 def _wrap(angle):
     return (angle + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
 
-KNOB_MODE = "constant"
-AVOID_TOXIN = False
-MIN_STOCK = 0.0
-AVOID_HOT = 0.0  # |temperature| threshold for bush zones; 0 disables
+def _entity_arrays(state):
+    """Positions, radii, alive masks and prototype tags of every entity slot."""
+    creature = state.entities.creature
+    bush = state.entities.bush
+    carcass = state.entities.carcass
+    neutral = state.entities.neutral
+    positions = jnp.concatenate(
+        [
+            creature.transform.pos,
+            bush.transform.pos,
+            carcass.transform.pos,
+            neutral.transform.pos,
+        ],
+        axis=0,
+    )
+    radii = jnp.concatenate(
+        [
+            creature.shape.radius,
+            bush.shape.radius,
+            carcass.shape.radius,
+            neutral.shape.radius,
+        ]
+    )
+    alive = jnp.concatenate([creature.alive, bush.alive, carcass.alive, neutral.alive])
+    kinds = jnp.concatenate(
+        [
+            jnp.full((creature.alive.shape[0],), C.CREATURE, dtype=jnp.int32),
+            jnp.full((bush.alive.shape[0],), C.BUSH, dtype=jnp.int32),
+            jnp.full((carcass.alive.shape[0],), C.CARCASS, dtype=jnp.int32),
+            jnp.full((neutral.alive.shape[0],), C.NEUTRAL, dtype=jnp.int32),
+        ]
+    )
+    local = jnp.concatenate(
+        [
+            jnp.arange(creature.alive.shape[0], dtype=jnp.int32),
+            jnp.arange(bush.alive.shape[0], dtype=jnp.int32),
+            jnp.arange(carcass.alive.shape[0], dtype=jnp.int32),
+            jnp.arange(neutral.alive.shape[0], dtype=jnp.int32),
+        ]
+    )
+    return positions, radii, alive, kinds, local
+
+
+def _prefer(mask, distance):
+    """Zero out non-preferred bushes, falling back to the full distance row."""
+    masked = jnp.where(mask, distance, jnp.inf)
+    any_preferred = jnp.any(mask, axis=1, keepdims=True)
+    return jnp.where(any_preferred, masked, distance)
 
 
 def forager_think(state, cfg):
-    """Scripted forager: nearest bush, stay inside, bite when stomach is not full.
-
-    --knob adaptive also raises the metabolic knob when the skin temperature
-    difference says the environment is colder than the body (and lowers it in
-    the heat); --avoid-toxin ignores berry species whose current composition is
-    toxic.  Both are calibration-only variants of the same simple policy.
-    """
+    """Scripted competent forager (calibration tool; reads true body state)."""
     creature = state.entities.creature
     bush = state.entities.bush
     pos = creature.transform.pos
     theta = creature.transform.theta
+    self_radius = creature.shape.radius
+    n_creature = pos.shape[0]
+
+    # Diet-aware species choice: animal-heavy diets go for nuts (kind 2),
+    # plant-heavy diets for species 0, the rest for species 1.
+    diet = diet_from_genome(creature.genome.g, cfg)
+    target_species = jnp.where(
+        diet[:, C.ANIMAL] > 0.35,
+        2,
+        jnp.where(diet[:, C.PLANT] >= 0.5, 0, 1),
+    )
+
     delta = bush.transform.pos[None, :, :] - pos[:, None, :]
     distance = jnp.linalg.norm(delta, axis=-1)
     distance = jnp.where(bush.alive[None, :], distance, jnp.inf)
+    preferred = bush.alive[None, :] & (bush.edible.kind[None, :] == target_species[:, None])
+    distance = _prefer(preferred, distance)
     if AVOID_TOXIN:
         species = bush.edible.kind
         toxin_share = state.comp[:, C.TOXIN][species]
-        distance = jnp.where(toxin_share[None, :] > 0.05, jnp.inf, distance)
+        distance = _prefer(toxin_share[None, :] <= 0.05, distance)
     if AVOID_HOT > 0.0:
-        # Avoid the lethal temperature zones when choosing a bush: scaled
-        # geographic temperature at the bush centre (day phase is global).
-        scaled = cfg.world.temperature_scale * (-2.0 + 4.0 * bush.transform.pos[:, 1] / cfg.world.height)
-        safe = jnp.abs(scaled) <= AVOID_HOT
-        safe_distance = jnp.where(safe[None, :], distance, jnp.inf)
-        distance = jnp.where(jnp.any(safe[None, :], axis=1, keepdims=True), safe_distance, distance)
+        scaled = cfg.world.temperature_scale * (
+            -2.0 + 4.0 * bush.transform.pos[:, 1] / cfg.world.height
+        )
+        distance = _prefer(jnp.abs(scaled)[None, :] <= AVOID_HOT, distance)
     if MIN_STOCK > 0.0:
-        # A competent forager does not sit on an emptied bush: prefer any bush
-        # that still has berries, fall back to the nearest bush otherwise.
-        stocked = bush.edible.stock >= MIN_STOCK
-        stocked_distance = jnp.where(stocked[None, :], distance, jnp.inf)
-        distance = jnp.where(jnp.any(stocked[None, :], axis=1, keepdims=True), stocked_distance, distance)
+        distance = _prefer(bush.edible.stock[None, :] >= MIN_STOCK, distance)
     distance = jnp.where(jnp.isfinite(distance), distance, 1e6)
-    nearest = jnp.argmin(distance, axis=1)
-    target = bush.transform.pos[nearest]
-    target_radius = bush.shape.radius[nearest]
+    bush_slot = jnp.argmin(distance, axis=1)
+    target = bush.transform.pos[bush_slot]
+    target_radius = bush.shape.radius[bush_slot]
     to_target = target - pos
     desired = jnp.arctan2(to_target[:, 1], to_target[:, 0])
     error = _wrap(desired - theta)
-    reach = creature.shape.radius + target_radius + 0.2
+    reach = self_radius + target_radius + 0.2
     in_range = jnp.linalg.norm(to_target, axis=1) <= reach
     facing = jnp.abs(error) <= jnp.deg2rad(30.0)
     stomach = jnp.sum(creature.body.G, axis=1)
     hungry = stomach < 0.8 * 0.3
-    zeros = jnp.zeros_like(theta)
-    if KNOB_MODE == "adaptive":
-        ambient, _ = world_fields.environment_at(state, cfg)
-        skin = ambient - creature.body.b
-        knob = jnp.clip(0.5 - 4.0 * skin, 0.0, 1.0)
+
+    # Bite only if the engine's nearest bite target is the chosen bush: the
+    # engine picks the nearest entity within +-30 degrees and reach, so the
+    # probe must reproduce that selection exactly.
+    ent_pos, ent_radius, ent_alive, ent_kind, ent_local = _entity_arrays(state)
+    delta_all = ent_pos[None, :, :] - pos[:, None, :]
+    distance_all = jnp.linalg.norm(delta_all, axis=-1)
+    angle_all = jnp.arctan2(delta_all[:, :, 1], delta_all[:, :, 0])
+    error_all = _wrap(angle_all - theta[:, None])
+    reach_all = self_radius[:, None] + ent_radius[None, :] + 0.2
+    self_mask = (ent_kind[None, :] == C.CREATURE) & (
+        ent_local[None, :] == jnp.arange(n_creature, dtype=jnp.int32)[:, None]
+    )
+    eligible = (
+        ent_alive[None, :]
+        & (distance_all <= reach_all)
+        & (jnp.abs(error_all) <= jnp.deg2rad(30.0))
+        & ~self_mask
+    )
+    candidate = jnp.where(eligible, distance_all, jnp.inf)
+    nearest_entity = jnp.argmin(candidate, axis=1)
+    bite_target_is_bush = (
+        (ent_kind[nearest_entity] == C.BUSH) & (ent_local[nearest_entity] == bush_slot)
+    )
+    bite_ok = hungry & in_range & facing & bite_target_is_bush
+
+    if KNOB_MODE == "true-b":
+        body_temperature = creature.body.b
+        knob = jnp.where(
+            body_temperature > 0.3,
+            0.0,
+            jnp.where(
+                body_temperature < -0.5,
+                1.0,
+                jnp.clip((0.3 - body_temperature) / 0.8, 0.0, 1.0),
+            ),
+        )
     else:
         knob = jnp.full_like(theta, KNOB)
+
+    zeros = jnp.zeros_like(theta)
     outputs = jnp.stack(
         [
-            jnp.where(in_range, -0.2, 1.0),  # approach, stop inside
-            jnp.clip(error / 0.5, -1.0, 1.0),  # steer
-            knob,  # metabolic knob
-            jnp.where(in_range & facing & hungry, 1.0, 0.0),  # bite
-            zeros,  # grab
-            zeros,  # drop
+            jnp.where(in_range, -0.2, 1.0),
+            jnp.clip(error / 0.5, -1.0, 1.0),
+            knob,
+            jnp.where(bite_ok, BITE_FORCE, 0.0),
+            zeros,
+            zeros,
         ],
         axis=1,
     )
@@ -120,7 +206,6 @@ def forager_think(state, cfg):
 
 
 def forager_think_system(state, cfg):
-    """System-contract wrapper around the scripted policy (no events of its own)."""
     return forager_think(state, cfg), events_mod.empty(cfg)
 
 
@@ -130,7 +215,6 @@ _FORAGER_SYSTEMS = tuple(
 
 
 def forager_step(state, cfg):
-    """engine step order with the scripted forager in place of think."""
     state = update(state, ledger=C.Ledger.zeros())
     buffer = events_mod.empty(cfg)
     for _, system in _FORAGER_SYSTEMS:
@@ -172,7 +256,17 @@ def _flatten(buffers, world: int) -> dict:
     capacity = buffers.kind.shape[2]
     mask = np.arange(capacity)[None, :] < counts[:, None]
     columns = {}
-    for name in ("kind", "uid", "tick", "cause", "nutrient", "target_kind", "same_lineage"):
+    for name in (
+        "kind",
+        "uid",
+        "tick",
+        "cause",
+        "nutrient",
+        "target_kind",
+        "same_lineage",
+        "reason",
+        "loss",
+    ):
         columns[name] = np.asarray(getattr(buffers, name))[:, world][mask]
     return columns
 
@@ -180,14 +274,17 @@ def _flatten(buffers, world: int) -> dict:
 def run_worlds(step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUNK) -> dict:
     states = _stack([initial_state(cfg, seed=seed) for seed in seeds])
     worlds = [
-        {"births": {}, "deaths": [], "bites": Counter(), "reseeds": 0} for _ in seeds
+        {
+            "births": {},        # uid -> (tick, reseed: bool)
+            "deaths": [],        # (tick, uid, cause, nutrient, same_lineage, loss[5])
+            "bites": Counter(),
+            "reseeds": 0,
+        }
+        for _ in seeds
     ]
     totals = np.zeros((len(seeds), len(events_mod.EVENT_KINDS)), dtype=np.int64)
     populations = []
     jitted = jax.jit(lambda current: _scan_chunk(step_fn, current, cfg, chunk, collect))
-    started = None
-    import time
-
     started = time.perf_counter()
     for _ in range(ticks // chunk):
         states, counts, buffers = jitted(states)
@@ -196,25 +293,33 @@ def run_worlds(step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUN
             for world in range(len(seeds)):
                 columns = _flatten(buffers, world)
                 births = columns["kind"] == events_mod.kind_code("birth")
-                for tick, uid in zip(columns["tick"][births].tolist(), columns["uid"][births].tolist()):
-                    worlds[world]["births"][int(uid)] = int(tick)
+                reseed_birth = births & (columns["reason"] == events_mod.reason_code("reseed"))
+                for tick, uid, reseed in zip(
+                    columns["tick"][births].tolist(),
+                    columns["uid"][births].tolist(),
+                    reseed_birth[births].tolist(),
+                ):
+                    worlds[world]["births"][int(uid)] = (int(tick), bool(reseed))
                 deaths = columns["kind"] == events_mod.kind_code("death")
-                for tick, uid, cause, nutrient, same in zip(
+                for tick, uid, cause, nutrient, same, loss in zip(
                     columns["tick"][deaths].tolist(),
                     columns["uid"][deaths].tolist(),
                     columns["cause"][deaths].tolist(),
                     columns["nutrient"][deaths].tolist(),
                     columns["same_lineage"][deaths].tolist(),
+                    columns["loss"][deaths].tolist(),
                 ):
                     worlds[world]["deaths"].append(
-                        (int(tick), int(uid), int(cause), int(nutrient), bool(same))
+                        (int(tick), int(uid), int(cause), int(nutrient), bool(same), tuple(loss))
                     )
                 bites = (columns["kind"] == events_mod.kind_code("bite")) & (
                     columns["target_kind"] == C.BUSH
                 )
                 for uid in columns["uid"][bites].tolist():
                     worlds[world]["bites"][int(uid)] += 1
-                worlds[world]["reseeds"] += int(np.sum(columns["kind"] == events_mod.kind_code("reseed")))
+                worlds[world]["reseeds"] += int(
+                    np.sum(columns["kind"] == events_mod.kind_code("reseed"))
+                )
         populations.append([int(population(_world(states, i))) for i in range(len(seeds))])
     wall = time.perf_counter() - started
     return {
@@ -226,51 +331,67 @@ def run_worlds(step_fn, cfg, seeds, ticks: int, collect: bool, chunk: int = CHUN
     }
 
 
+def _lifespan_stats(ages: list[int]) -> dict:
+    if not ages:
+        return {"count": 0, "median": None, "matured": 0, "matured_median": None}
+    matured = [age for age in ages if age >= A_MATURE]
+    return {
+        "count": len(ages),
+        "median": float(np.median(ages)),
+        "matured": len(matured),
+        "matured_median": float(np.median(matured)) if matured else None,
+    }
+
+
 def summarize(cfg, result, seeds, cohort_len: int) -> dict:
     pop = np.asarray(result["populations"])
     capacity = int(cfg.capacities.creature)
     causes: Counter = Counter()
     nutrient_counts = [0, 0, 0]
     bite_deaths = {"same_lineage": 0, "other": 0}
+    loss_by_cause: dict[str, list] = {}
+    ages_reproduction: list[int] = []
+    ages_reseed: list[int] = []
     per_world = []
     cohorts: dict[int, dict] = {}
-    all_lifespans = []
     for world, data in enumerate(result["worlds"]):
-        lifespans = []
-        for tick, uid, cause, nutrient, same in data["deaths"]:
-            born = data["births"].get(uid)
-            causes[events_mod.DEATH_CAUSES[cause]] += 1
+        for tick, uid, cause, nutrient, same, loss in data["deaths"]:
+            name = events_mod.DEATH_CAUSES[cause]
+            causes[name] += 1
+            loss_by_cause.setdefault(name, []).append(loss)
             if cause == events_mod.cause_code("nutrition") and 0 <= nutrient < C.N_NUTRIENTS:
                 nutrient_counts[int(nutrient)] += 1
             if cause == events_mod.cause_code("bite"):
                 bite_deaths["same_lineage" if same else "other"] += 1
+            born = data["births"].get(uid)
             if born is not None:
-                lifespans.append(tick - born)
-        all_lifespans.extend(lifespans)
+                born_tick, reseed_born = born
+                age = tick - born_tick
+                (ages_reseed if reseed_born else ages_reproduction).append(age)
+                if not reseed_born:
+                    key = int(born_tick // cohort_len)
+                    entry = cohorts.setdefault(
+                        key, {"born": 0, "bites": 0, "lifespans": [], "biters": 0}
+                    )
+                    entry["born"] += 1
+                    bites = data["bites"].get(uid, 0)
+                    entry["bites"] += bites
+                    entry["lifespans"].append(age)
+                    if bites:
+                        entry["biters"] += 1
+        born_groups = Counter(reseed for _, reseed in data["births"].values())
         per_world.append(
             {
                 "seed": seeds[world],
                 "final_population": int(pop[-1, world]),
                 "min_population": int(pop[:, world].min()),
                 "max_population": int(pop[:, world].max()),
-                "births": len(data["births"]),
+                "births_reproduction": int(born_groups.get(False, 0)),
+                "births_reseed": int(born_groups.get(True, 0)),
                 "deaths": len(data["deaths"]),
                 "reseeds": data["reseeds"],
-                "lifespan_median": float(np.median(lifespans)) if lifespans else None,
             }
         )
-        for uid, born in data["births"].items():
-            key = int(born // cohort_len)
-            entry = cohorts.setdefault(key, {"born": 0, "bites": 0, "lifespans": [], "biters": 0})
-            entry["born"] += 1
-            bites = data["bites"].get(uid, 0)
-            entry["bites"] += bites
-            if bites:
-                entry["biters"] += 1
-            for death in data["deaths"]:
-                if death[1] == uid:
-                    entry["lifespans"].append(death[0] - born)
-                    break
     cohort_rows = []
     for key in sorted(cohorts):
         entry = cohorts[key]
@@ -285,24 +406,31 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
                 "mean_lifespan": float(np.mean(entry["lifespans"])) if entry["lifespans"] else None,
             }
         )
+    loss_summary = {
+        name: [float(np.mean([row[index] for row in rows])) for index in range(C.N_DAMAGE_SOURCES)]
+        for name, rows in loss_by_cause.items()
+    }
     return {
         "per_world": per_world,
         "population_final": pop[-1].tolist(),
         "population_min": pop.min(axis=0).tolist(),
         "population_mean": float(pop.mean()),
         "capacity_fraction": float(np.mean(pop >= capacity)),
-        "births": int(sum(len(data["births"]) for data in result["worlds"])),
+        "births_reproduction": int(sum(w["births_reproduction"] for w in per_world)),
+        "births_reseed": int(sum(w["births_reseed"] for w in per_world)),
         "deaths": int(sum(len(data["deaths"]) for data in result["worlds"])),
         "reseeds": int(sum(data["reseeds"] for data in result["worlds"])),
         "death_causes": dict(causes),
+        "death_loss_mean": loss_summary,
         "nutrition_types": {
             "plant": nutrient_counts[C.PLANT],
             "animal": nutrient_counts[C.ANIMAL],
             "toxin": nutrient_counts[C.TOXIN],
         },
         "bite_deaths": bite_deaths,
-        "lifespan_median": float(np.median(all_lifespans)) if all_lifespans else None,
-        "cohorts": cohort_rows,
+        "lifespan_reproduction": _lifespan_stats(ages_reproduction),
+        "lifespan_reseed": _lifespan_stats(ages_reseed),
+        "cohorts_reproduction": cohort_rows,
     }
 
 
@@ -344,7 +472,7 @@ def main() -> None:
     parser.add_argument("--tiny", action="store_true")
     parser.add_argument("--temperature-scale", type=float, default=None)
     parser.add_argument("--knob", type=float, default=0.5)
-    parser.add_argument("--knob-mode", choices=("constant", "adaptive"), default="constant")
+    parser.add_argument("--knob-mode", choices=("constant", "true-b"), default="true-b")
     parser.add_argument("--avoid-toxin", action="store_true")
     parser.add_argument("--min-stock", type=float, default=0.0)
     parser.add_argument("--avoid-hot", type=float, default=0.0)
@@ -363,6 +491,13 @@ def main() -> None:
     result = run_worlds(step_fn, cfg, seeds, args.ticks, collect=True)
     summary = summarize(cfg, result, seeds, args.cohort)
     summary["arm"] = args.arm
+    summary["probe"] = {
+        "knob_mode": KNOB_MODE,
+        "bite_force": BITE_FORCE,
+        "avoid_toxin": AVOID_TOXIN,
+        "min_stock": MIN_STOCK,
+        "avoid_hot": AVOID_HOT,
+    }
     summary["design"] = {
         "base_metabolism": cfg.body.base_metabolism,
         "bush_capacity": cfg.capacities.bush,
@@ -378,7 +513,19 @@ def main() -> None:
     out = Path(args.out or ("runs/diagnostics/" + args.arm + ".json"))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=2))
-    print(json.dumps({k: summary[k] for k in ("arm", "births", "deaths", "reseeds", "population_final", "population_mean", "capacity_fraction", "death_causes", "nutrition_types", "bite_deaths", "lifespan_median")}, ensure_ascii=False, indent=2))
+    keys = (
+        "arm",
+        "births_reproduction",
+        "births_reseed",
+        "deaths",
+        "reseeds",
+        "population_mean",
+        "death_causes",
+        "death_loss_mean",
+        "lifespan_reproduction",
+        "lifespan_reseed",
+    )
+    print(json.dumps({key: summary[key] for key in keys}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

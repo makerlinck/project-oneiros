@@ -90,6 +90,7 @@ _EVENT_FIELDS = (
     "damage",
     "cause",
     "nutrient",
+    "loss",
     "success",
     "reason",
 )
