@@ -37,6 +37,7 @@ from life_sandbox.core import ramp as ramp_mod
 from life_sandbox.core.state import population
 from life_sandbox.core.step import SYSTEMS, _event_counts, step as engine_step
 from life_sandbox.core.systems import reproduction as reproduction_system
+from life_sandbox.analysis import probe
 from life_sandbox.core.struct import update
 from life_sandbox.world.init import diet_from_genome, initial_state
 
@@ -106,13 +107,6 @@ def _entity_arrays(state):
     return positions, radii, alive, kinds, local
 
 
-def _prefer(mask, distance):
-    """Zero out non-preferred bushes, falling back to the full distance row."""
-    masked = jnp.where(mask, distance, jnp.inf)
-    any_preferred = jnp.any(mask, axis=1, keepdims=True)
-    return jnp.where(any_preferred, masked, distance)
-
-
 def forager_think(state, cfg):
     """Scripted competent forager (calibration tool; reads true body state)."""
     creature = state.entities.creature
@@ -123,44 +117,23 @@ def forager_think(state, cfg):
     n_creature = pos.shape[0]
 
     # Probe v2 (2026-11-06 review): a species is eligible only if its animal
-    # supply covers the animal demand with a 1.3x margin at full digestion
-    # (0.0135/tick * absorption 0.9*sqrt(rho_A) * c_A >= 1.3*rho_A).
+    # supply covers the animal demand with a 1.3x margin at full digestion.
+    # Selection lives in analysis/probe.py so it can be unit tested.
     diet = diet_from_genome(creature.genome.g, cfg)  # (N, 3)
-    rho_animal = diet[:, C.ANIMAL]
-    animal_share = state.comp[C.ANIMAL][bush.edible.kind]  # per bush slot
-    # Per-tick metabolic demand (ramp-scaled base metabolism): the animal intake
-    # at full digestion must cover 1.3x of the animal share of that demand.
     c_tot = cfg.body.base_metabolism * ramp_mod.metabolism_multiplier(state.tick, cfg)
-    supplied = 0.0135 * 0.9 * jnp.sqrt(rho_animal)[:, None] * animal_share[None, :]
-    eligible = bush.alive[None, :] & (supplied >= 1.3 * rho_animal[:, None] * c_tot)
-
     delta = bush.transform.pos[None, :, :] - pos[:, None, :]
     distance0 = jnp.where(bush.alive[None, :], jnp.linalg.norm(delta, axis=-1), jnp.inf)
-    stocked = bush.edible.stock >= 0.3
-
-    def _pick(candidates, distance0, stocked):
-        base = jnp.where(candidates, distance0, jnp.inf)
-        stocked_base = jnp.where(candidates & stocked[None, :], distance0, jnp.inf)
-        picked = jnp.where(
-            jnp.any(jnp.isfinite(stocked_base), axis=1, keepdims=True), stocked_base, base
-        )
-        return jnp.where(jnp.any(jnp.isfinite(picked), axis=1, keepdims=True), picked, distance0)
-
-    if STATIONARY:
-        pick = distance0
-    else:
-        pick = _pick(eligible, distance0, stocked)
-    slot0 = jnp.argmin(pick, axis=1)
-    toxic_share = state.comp[C.TOXIN][bush.edible.kind]
-    own_toxic = toxic_share[bush.edible.kind[slot0]] > 0.05
-    needs_toxin = creature.body.N[:, C.TOXIN] >= 0.5 * diet[:, C.TOXIN]
-    switch = own_toxic & needs_toxin
-    non_toxic = eligible & (toxic_share[None, :] <= 0.05)
-    alternative = _pick(non_toxic, distance0, stocked)
-    if not STATIONARY:
-        pick = jnp.where(switch[:, None], alternative, pick)
-    distance = jnp.where(jnp.isfinite(pick), pick, 1e6)
-    bush_slot = jnp.argmin(distance, axis=1)
+    bush_slot = probe.select_bush_slot(
+        diet,
+        state.comp,
+        bush.edible.kind,
+        bush.alive,
+        bush.edible.stock,
+        distance0,
+        c_tot,
+        creature.body.N[:, C.TOXIN],
+        stationary=STATIONARY,
+    )
     target = bush.transform.pos[bush_slot]
     target_radius = bush.shape.radius[bush_slot]
     to_target = target - pos
