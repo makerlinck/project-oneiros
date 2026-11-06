@@ -48,6 +48,7 @@ def _wrap(angle):
 
 KNOB_MODE = "constant"
 AVOID_TOXIN = False
+MIN_STOCK = 0.0
 
 
 def forager_think(state, cfg):
@@ -69,6 +70,12 @@ def forager_think(state, cfg):
         species = bush.edible.kind
         toxin_share = state.comp[:, C.TOXIN][species]
         distance = jnp.where(toxin_share[None, :] > 0.05, jnp.inf, distance)
+    if MIN_STOCK > 0.0:
+        # A competent forager does not sit on an emptied bush: prefer any bush
+        # that still has berries, fall back to the nearest bush otherwise.
+        stocked = bush.edible.stock >= MIN_STOCK
+        stocked_distance = jnp.where(stocked[None, :], distance, jnp.inf)
+        distance = jnp.where(jnp.any(stocked[None, :], axis=1, keepdims=True), stocked_distance, distance)
     distance = jnp.where(jnp.isfinite(distance), distance, 1e6)
     nearest = jnp.argmin(distance, axis=1)
     target = bush.transform.pos[nearest]
@@ -331,13 +338,15 @@ def main() -> None:
     parser.add_argument("--knob", type=float, default=0.5)
     parser.add_argument("--knob-mode", choices=("constant", "adaptive"), default="constant")
     parser.add_argument("--avoid-toxin", action="store_true")
+    parser.add_argument("--min-stock", type=float, default=0.0)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
-    global KNOB, KNOB_MODE, AVOID_TOXIN
+    global KNOB, KNOB_MODE, AVOID_TOXIN, MIN_STOCK
     KNOB = float(args.knob)
     KNOB_MODE = args.knob_mode
     AVOID_TOXIN = bool(args.avoid_toxin)
+    MIN_STOCK = float(args.min_stock)
     cfg = design_config(args)
     seeds = [9300 + i for i in range(args.worlds)]
     step_fn = forager_step if args.arm == "forager" else engine_step
