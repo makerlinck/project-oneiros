@@ -56,6 +56,52 @@ def _log_uniform(rng: random.Random, low: float, high: float) -> float:
     return math.exp(rng.uniform(math.log(low), math.log(high)))
 
 
+COARSE_GRID: list[dict] = [
+    {"base_metabolism": metabolism, "temperature_scale": temperature}
+    for metabolism in (0.0005, 0.0008, 0.0012)
+    for temperature in (0.1, 0.3)
+]
+
+
+def coarse_config(index: int) -> tuple[Config, dict]:
+    """Deterministic targeted sweep of the feasibility corner (coarse mode).
+
+    Maximal food (180 bushes, high regeneration), maximal ramp and founder
+    reserves; varies only the two knobs that the sanity runs showed to dominate
+    mortality (metabolism and temperature amplitude).
+    """
+    cell = COARSE_GRID[index % len(COARSE_GRID)]
+    params = {
+        "bush_regen_rate": 0.10,
+        "bush_regen_base": 1e-3,
+        "bush_capacity": 180,
+        "base_metabolism": cell["base_metabolism"],
+        "founder_reserves": 0.5,
+        "ramp_ticks": 600,
+        "temperature_scale": cell["temperature_scale"],
+    }
+    base = Config.default()
+    cfg = base.replaced(
+        capacities=Capacities(creature=256, bush=params["bush_capacity"], carcass=64, neutral=3),
+        world=WorldConfig(
+            bush_regen_rate=params["bush_regen_rate"],
+            bush_regen_base=params["bush_regen_base"],
+            temperature_scale=params["temperature_scale"],
+            founders=64,
+            ramp_ticks=params["ramp_ticks"],
+        ),
+        body=BodyConfig(
+            base_metabolism=params["base_metabolism"],
+            founder_reserves=params["founder_reserves"],
+        ),
+        brain=BrainConfig(kind="plastic_rnn"),
+        learning=LearningConfig(plasticity=False, prediction=False),
+        run=RunConfig(seed=0, ticks=500, segment_ticks=64),
+    )
+    cfg.validate()
+    return cfg, params
+
+
 def sample_config(rng: random.Random, index: int) -> tuple[Config, dict]:
     """Draw one calibration config from the agreed round-1 space."""
     bush_capacity = rng.choice([60, 90, 120, 150, 180])
@@ -161,15 +207,22 @@ def measure(cfg: Config, seeds: list[int], l_ticks: int, cycles: int) -> dict:
 
 
 def _score(pop, births, reseeds, capacity_ticks: int, n_worlds: int) -> float:
-    """Ranking score for round 1: survival first, then births, then fewer rescues."""
-    survivors = float(np.mean(pop[-1] > 0))
-    min_pop = float(np.mean(pop.min(axis=0)))
+    """Ranking score: sustainable populations first, rescues are heavily penalised.
+
+    'survived' alone is misleading because reseeds keep dead worlds alive, so
+    the score uses the fraction of worlds whose population never fell to the
+    reseed threshold (8) and the time-averaged population, then births.
+    """
+    reseed_threshold = 8
+    self_sustaining = float(np.mean(pop.min(axis=0) > reseed_threshold))
+    mean_pop = float(np.mean(pop) / 256.0)
     birth_rate = float(np.sum(births)) / max(1, n_worlds)
     rescue_penalty = float(np.sum(reseeds)) / max(1, n_worlds)
     capacity_penalty = capacity_ticks / max(1, n_worlds)
     return round(
-        10.0 * survivors + 0.2 * min_pop + birth_rate - 2.0 * rescue_penalty - 0.5 * capacity_penalty,
-        6,
+        100.0 * self_sustaining + 50.0 * mean_pop + 0.2 * birth_rate
+        - 5.0 * rescue_penalty - 0.5 * capacity_penalty,
+        4,
     )
 
 
@@ -229,6 +282,7 @@ def main() -> None:
     parser.add_argument("--out", default="runs/m1_search/round1")
     parser.add_argument("--configs-file", default=None)
     parser.add_argument("--control", action="store_true", help="also run the randomize_genome control")
+    parser.add_argument("--sample-mode", choices=("random", "coarse"), default="random")
     args = parser.parse_args()
     if not args.control:
         args.control = args.stage == "round2"
@@ -245,7 +299,9 @@ def main() -> None:
     ranked = []
     total = args.configs if args.stage == "round1" else 0
     for index in range(total):
-        cfg, params = sample_config(rng, index)
+        cfg, params = (
+            coarse_config(index) if args.sample_mode == "coarse" else sample_config(rng, index)
+        )
         if index in done:
             continue
         seeds = [args.seed_base + index * 100 + world for world in range(args.worlds)]
