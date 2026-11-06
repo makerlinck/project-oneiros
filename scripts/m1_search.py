@@ -86,9 +86,11 @@ def sample_config(rng: random.Random, index: int) -> tuple[Config, dict]:
         ),
         brain=BrainConfig(kind="plastic_rnn"),
         learning=LearningConfig(plasticity=False, prediction=False),
-        # One compiled scan per config: the whole L-sized chunk is the segment,
-        # so a config compiles once and the 20 cycles reuse the compiled fn.
-        run=RunConfig(seed=0, ticks=500, segment_ticks=500),
+        # Segment length is a throughput knob, but a 500-tick scan takes minutes
+        # of XLA compile per config (measured on the 3090), so the search uses
+        # 64-tick segments: compile is seconds and warmed throughput is ~2400
+        # world-ticks/s for 16 worlds.
+        run=RunConfig(seed=0, ticks=500, segment_ticks=64),
     )
     cfg.validate()
     return cfg, params
@@ -291,7 +293,7 @@ def main() -> None:
             ),
             brain=BrainConfig(kind="plastic_rnn"),
             learning=LearningConfig(plasticity=False, prediction=False),
-            run=RunConfig(seed=0, ticks=args.l_ticks, segment_ticks=args.l_ticks),
+            run=RunConfig(seed=0, ticks=args.l_ticks, segment_ticks=64),
         )
         worlds = [estimate_lifespan(cfg, args.seed_base + 5000 + i, args.l_ticks, args.cycles) for i in range(10)]
         entry = {"index": record["index"], "params": params, "worlds": worlds}
