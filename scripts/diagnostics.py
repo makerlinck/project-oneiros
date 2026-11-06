@@ -438,7 +438,13 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
         name: [float(np.mean([row[index] for row in rows])) for index in range(C.N_DAMAGE_SOURCES)]
         for name, rows in loss_by_cause.items()
     }
+    event_counts = {
+        name: int(value)
+        for name, value in zip(events_mod.EVENT_KINDS, np.asarray(result["counts"]).sum(axis=0).tolist())
+        if value
+    }
     return {
+        "event_counts": event_counts,
         "per_world": per_world,
         "population_final": pop[-1].tolist(),
         "population_min": pop.min(axis=0).tolist(),
