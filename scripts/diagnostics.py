@@ -371,14 +371,39 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
                 if not reseed_born:
                     key = int(born_tick // cohort_len)
                     entry = cohorts.setdefault(
-                        key, {"born": 0, "bites": 0, "lifespans": [], "biters": 0}
+                        key,
+                        {
+                            "born": 0,
+                            "bites": 0,
+                            "lifespans": [],
+                            "lifetime_ticks": 0,
+                            "biters": 0,
+                            "died": 0,
+                        },
                     )
-                    entry["born"] += 1
-                    bites = data["bites"].get(uid, 0)
-                    entry["bites"] += bites
                     entry["lifespans"].append(age)
-                    if bites:
-                        entry["biters"] += 1
+                    entry["lifetime_ticks"] += age
+                    entry["died"] += 1
+        for uid, (born_tick, reseed_born) in data["births"].items():
+            if reseed_born:
+                continue
+            key = int(born_tick // cohort_len)
+            entry = cohorts.setdefault(
+                key,
+                {
+                    "born": 0,
+                    "bites": 0,
+                    "lifespans": [],
+                    "lifetime_ticks": 0,
+                    "biters": 0,
+                    "died": 0,
+                },
+            )
+            entry["born"] += 1
+            bites = data["bites"].get(uid, 0)
+            entry["bites"] += bites
+            if bites:
+                entry["biters"] += 1
         born_groups = Counter(reseed for _, reseed in data["births"].values())
         per_world.append(
             {
@@ -396,13 +421,16 @@ def summarize(cfg, result, seeds, cohort_len: int) -> dict:
     for key in sorted(cohorts):
         entry = cohorts[key]
         born = max(entry["born"], 1)
+        ticks = entry["lifetime_ticks"]
         cohort_rows.append(
             {
                 "cohort": key,
                 "born": entry["born"],
+                "died": entry["died"],
                 "biters": entry["biters"],
                 "bites_per_individual": entry["bites"] / born,
                 "fraction_biters": entry["biters"] / born,
+                "bites_per_lifetime_tick": (entry["bites"] / ticks) if ticks else None,
                 "mean_lifespan": float(np.mean(entry["lifespans"])) if entry["lifespans"] else None,
             }
         )
