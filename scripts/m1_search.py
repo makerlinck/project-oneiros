@@ -104,15 +104,19 @@ def coarse_config(index: int) -> tuple[Config, dict]:
 
 def sample_config(rng: random.Random, index: int) -> tuple[Config, dict]:
     """Draw one calibration config from the agreed round-1 space."""
-    bush_capacity = rng.choice([60, 90, 120, 150, 180])
+    # Ranges are the feasibility region measured by the 2026-11-06 micro-sweep:
+    # at base_metabolism <= 0.0002 with abundant food and mild temperature the
+    # populations stop relying on reseeds (metabolism 0.00018: 4 rescue episodes
+    # over 8 worlds x 5000 ticks, mean population 47.6).
+    bush_capacity = rng.choice([120, 180, 240])
     params = {
-        "bush_regen_rate": round(rng.uniform(0.02, 0.10), 5),
-        "bush_regen_base": round(_log_uniform(rng, 1e-4, 1e-3), 7),
+        "bush_regen_rate": round(rng.uniform(0.08, 0.12), 5),
+        "bush_regen_base": round(_log_uniform(rng, 3e-4, 1.5e-3), 7),
         "bush_capacity": bush_capacity,
-        "base_metabolism": round(_log_uniform(rng, 0.0005, 0.0025), 7),
+        "base_metabolism": round(_log_uniform(rng, 1e-4, 6e-4), 7),
         "founder_reserves": round(rng.uniform(0.3, 0.5), 4),
-        "ramp_ticks": int(rng.uniform(100, 600)),
-        "temperature_scale": round(rng.uniform(0.1, 1.0), 3),
+        "ramp_ticks": int(rng.uniform(200, 800)),
+        "temperature_scale": round(rng.uniform(0.05, 0.5), 3),
     }
     base = Config.default()
     cfg = base.replaced(
@@ -213,15 +217,16 @@ def _score(pop, births, reseeds, capacity_ticks: int, n_worlds: int) -> float:
     the score uses the fraction of worlds whose population never fell to the
     reseed threshold (8) and the time-averaged population, then births.
     """
-    reseed_threshold = 8
-    self_sustaining = float(np.mean(pop.min(axis=0) > reseed_threshold))
-    mean_pop = float(np.mean(pop) / 256.0)
-    birth_rate = float(np.sum(births)) / max(1, n_worlds)
-    rescue_penalty = float(np.sum(reseeds)) / max(1, n_worlds)
+    # Reseed events are emitted per reseeded individual (32 per rescue episode).
+    episodes = reseeds.astype(np.float64) / 32.0
+    stable = ((episodes == 0) & (pop[-1] >= 20)).astype(np.float64).mean()
+    minimal_rescue = float(np.maximum(0.0, 1.0 - episodes.mean()))
+    births_mean = float(births.mean())
+    final_mean = float(pop[-1].mean())
     capacity_penalty = capacity_ticks / max(1, n_worlds)
     return round(
-        100.0 * self_sustaining + 50.0 * mean_pop + 0.2 * birth_rate
-        - 5.0 * rescue_penalty - 0.5 * capacity_penalty,
+        100.0 * stable + 20.0 * minimal_rescue + 0.5 * births_mean + 0.2 * final_mean
+        - 0.5 * capacity_penalty,
         4,
     )
 
