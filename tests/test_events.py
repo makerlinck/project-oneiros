@@ -25,6 +25,14 @@ def test_append_writes_prefix_and_count():
     assert bool(buffer.success[0])
 
 
+def test_nutrient_field_defaults_to_none_and_accepts_a_type():
+    cfg = _small_cfg()
+    buffer = events.empty(cfg)
+    assert int(buffer.nutrient[0]) == -1
+    buffer = events.append(buffer, kind=events.kind_code("death"), uid=1, nutrient=C.PLANT)
+    assert int(buffer.nutrient[0]) == C.PLANT
+
+
 def test_overflow_increments_dropped_without_growing():
     cfg = _small_cfg()
     buffer = events.empty(cfg)

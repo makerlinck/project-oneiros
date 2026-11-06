@@ -667,7 +667,7 @@ W_slow 的初值取自基因组，清醒时不变；睡眠中巩固：W_slow += 
 | 表 | 粒度 | 主要字段 |
 |---|---|---|
 | `runs` | 每次运行 | run_id、mode（confirmatory/exploratory/intervention）、prereg_id、code_commit、config_hash、种子、起止时间、GPU、最终状态哈希 |
-| `events` | 每个事件 | world、tick、type、uid、目标原型、target_uid、是否同一谱系、x、y、取走的 Δn[3]、吸收量[3]、ΔX、伤害、cause、成败与原因。type 包括 birth、birth_fail、death、bite、grab、grab_fail、drop、escape、toxin_switch、reseed、sleep_start、sleep_end（注明自己醒来还是被唤醒、回放是否完成）、recall（深度与读到的帧数） |
+| `events` | 每个事件 | world、tick、type、uid、目标原型、target_uid、是否同一谱系、x、y、取走的 Δn[3]、吸收量[3]、ΔX、伤害、cause、缺哪类营养（nutrient，仅死亡事件）、成败与原因。type 包括 birth、birth_fail、death、bite、grab、grab_fail、drop、escape、toxin_switch、reseed、sleep_start、sleep_end（注明自己醒来还是被唤醒、回放是否完成）、recall（深度与读到的帧数） |
 | `lives` | 每个个体一行 | uid、parent_uid、lineage_id、generation、出生与死亡 tick、死因、后代数、食性 ρ、一生按来源（灌木各种类、尸体、活体）和按营养类型分的摄入与吸收、被咬次数、咬活体次数、被搬运次数、搬运他物次数、基因组或基因组指针 |
 | `world_ts` | 每 k_ts 个 tick | 种群数；出生数；按死因分的死亡数；平均 ΣN；平均 b；浆果总库存；尸体数；食性分布（ρ 的直方图）；食物网计数（各食性区间之间的咬与吸收）；槽位上限是否被触及；性状的均值与方差 |
 | `focal_traces` | 焦点个体，每 tick | uid、tick、s (D)、ŝ (D)、h (H)、各单元 \|ΔW^fast\|、m (M)、out (6)、痛觉各源强度 a[9]、G[3]、N[3]、I、X、b、p、v、ω、pos、θ、持有物的原型和 uid、S、asleep、回想深度 d、队列占用与强度分布 |

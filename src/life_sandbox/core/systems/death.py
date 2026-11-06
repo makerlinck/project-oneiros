@@ -219,6 +219,7 @@ def apply(state: WorldState, cfg: Config) -> tuple[WorldState, events.EventBuffe
         x=creature.transform.pos[:, 0],
         y=creature.transform.pos[:, 1],
         cause=cause,
+        nutrient=creature.damage.nutrient,
         success=jnp.ones((capacity,), dtype=jnp.bool_),
     )
 

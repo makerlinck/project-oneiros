@@ -73,6 +73,7 @@ _ARRAY_FIELDS = (
     "dX",
     "damage",
     "cause",
+    "nutrient",
     "success",
     "reason",
 )
@@ -108,6 +109,8 @@ class EventBuffer:
     dX: jax.Array
     damage: jax.Array
     cause: jax.Array
+    # Death only: which nutrient was missing (component index, -1 = not applicable).
+    nutrient: jax.Array
     success: jax.Array
     reason: jax.Array
 
@@ -130,6 +133,7 @@ def empty(cfg) -> EventBuffer:
         dX=jnp.zeros(capacity, dtype=jnp.float32),
         damage=jnp.zeros(capacity, dtype=jnp.float32),
         cause=jnp.zeros(capacity, dtype=jnp.int8),
+        nutrient=jnp.full(capacity, -1, dtype=jnp.int8),
         success=jnp.ones(capacity, dtype=jnp.bool_),
         reason=jnp.zeros(capacity, dtype=jnp.int8),
     )
@@ -148,6 +152,8 @@ def append(buffer: EventBuffer, **values) -> EventBuffer:
         if value is None:
             if name == "success":
                 value = True
+            elif name == "nutrient":
+                value = -1
             elif array.ndim > 1:
                 value = jnp.zeros(array.shape[1:], dtype=array.dtype)
             else:

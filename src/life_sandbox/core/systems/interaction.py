@@ -89,6 +89,7 @@ _EVENT_FIELDS = (
     "dX",
     "damage",
     "cause",
+    "nutrient",
     "success",
     "reason",
 )
@@ -118,7 +119,8 @@ def append_events_batch(buffer: events.EventBuffer, valid: jax.Array, **values) 
         array = getattr(buffer, name)
         value = values.get(name)
         if value is None:
-            cast = jnp.zeros((batch,) + array.shape[1:], dtype=array.dtype)
+            fill = -1 if name == "nutrient" else 0
+            cast = jnp.full((batch,) + array.shape[1:], fill, dtype=array.dtype)
         else:
             cast = jnp.asarray(value, dtype=array.dtype)
             if cast.ndim < array.ndim:
