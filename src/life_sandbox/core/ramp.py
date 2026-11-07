@@ -29,6 +29,9 @@ def fraction(tick, cfg, params=None) -> jnp.ndarray:
     With runtime `params` the ramp length is a traced scalar, so every row of a
     batched scan can use its own ramp_ticks (including 0 = no ramp).
     """
+    fixed = float(cfg.world.ramp_fixed_fraction)
+    if fixed >= 0.0:
+        return jnp.asarray(fixed, dtype=jnp.float32)
     if params is None:
         ticks = cfg.world.ramp_ticks
         if ticks <= 0:

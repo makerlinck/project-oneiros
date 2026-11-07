@@ -1069,8 +1069,25 @@ def summarize(cfg, result, seeds, cohort_len: int, chunk: int = CHUNK) -> dict:
                         "uid": np.asarray(sample["uid"])[alive].tolist(),
                         "x": positions[:, 0].tolist(),
                         "y": positions[:, 1].tolist(),
+                        "stock": np.asarray(sample["stock"])[np.asarray(sample["bush_alive"])].tolist(),
                     }
                 )
+        snapshot_bushes = []
+        states = result.get("states")
+        if states is not None:
+            bush = states.entities.bush
+            for world in range(int(bush.uid.shape[0])):
+                alive = np.asarray(bush.alive[world])
+                snapshot_bushes.append(
+                    {
+                        "world": world,
+                        "uid": np.asarray(bush.uid[world])[alive].tolist(),
+                        "kind": np.asarray(bush.edible.kind[world])[alive].tolist(),
+                        "x": np.asarray(bush.transform.pos[world])[alive, 0].tolist(),
+                        "y": np.asarray(bush.transform.pos[world])[alive, 1].tolist(),
+                    }
+                )
+        summary["snapshot_bushes"] = snapshot_bushes
     generation_behavior = {}
     for data in result["worlds"]:
         death_tick = {int(row[1]): int(row[0]) for row in data["deaths"]}
@@ -1214,6 +1231,12 @@ def design_config(args) -> Config:
         cfg = cfg.replaced(
             world=replace(cfg.world, reseed_until_tick=int(args.reseed_until_tick))
         )
+    if args.ramp_fraction is not None:
+        cfg = cfg.replaced(
+            world=replace(cfg.world, ramp_fixed_fraction=float(args.ramp_fraction))
+        )
+    if args.no_bite_living:
+        cfg = cfg.replaced(world=replace(cfg.world, bite_living_enabled=False))
     if args.ramp_metabolism is not None:
         cfg = cfg.replaced(
             world=replace(cfg.world, ramp_metabolism_multiplier=float(args.ramp_metabolism))
@@ -1281,6 +1304,8 @@ def main() -> None:
     parser.add_argument("--reseed-until-tick", type=int, default=-1)
     parser.add_argument("--chunk", type=int, default=128)
     parser.add_argument("--snapshots", action="store_true")
+    parser.add_argument("--ramp-fraction", type=float, default=None)
+    parser.add_argument("--no-bite-living", action="store_true")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -1342,6 +1367,8 @@ def main() -> None:
         "ramp_berry_multiplier": cfg.world.ramp_berry_multiplier,
         "ramp_temperature_multiplier": cfg.world.ramp_temperature_multiplier,
         "reseed_until_tick": cfg.world.reseed_until_tick,
+        "ramp_fixed_fraction": cfg.world.ramp_fixed_fraction,
+        "bite_living_enabled": cfg.world.bite_living_enabled,
         "chunk": args.chunk,
     }
     summary["seeds"] = seeds

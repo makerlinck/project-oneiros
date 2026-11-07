@@ -672,6 +672,8 @@ def apply(
     _, take_by_priority = jax.lax.scan(_settle_step, remaining, perm)
     take = jnp.zeros(n, dtype=jnp.float32).at[perm].set(take_by_priority)
 
+    if not cfg.world.bite_living_enabled:
+        take = jnp.where(bite_kind == C.CREATURE, 0.0, take)
     taken_total = jnp.zeros(total, dtype=jnp.float32).at[bite_id].add(take)
     creature_take = taken_total[offset_creature : offset_creature + n]
     bush_take = taken_total[offset_bush : offset_bush + nb]
@@ -719,7 +721,7 @@ def apply(
 
     # Bite damage: living targets only, never limited by the biter's stomach.
     damage = jnp.where(
-        content_active & (bite_kind == C.CREATURE),
+        content_active & (bite_kind == C.CREATURE) & cfg.world.bite_living_enabled,
         _CREATURE_DAMAGE_SCALE * bite_strength * grip_power,
         jnp.asarray(0.0, jnp.float32),
     )

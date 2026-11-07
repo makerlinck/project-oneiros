@@ -830,3 +830,20 @@ def test_juvenile_demand_uses_mass_power_075():
     assert everything == pytest.approx(
         float(base * (mass_scale + mass + 0.25 + 1.0)), abs=1e-6
     )
+
+
+def test_ramp_fraction_can_be_frozen():
+    """Diagnostics: ramp_fixed_fraction freezes energy/temperature/toxin ramps."""
+    from dataclasses import replace as _replace
+
+    from life_sandbox.core import ramp
+
+    cfg = ramp_cfg()
+    cfg = _replace(cfg, world=_replace(cfg.world, ramp_fixed_fraction=0.4))
+    assert float(ramp.fraction(0, cfg)) == pytest.approx(0.4)
+    assert float(ramp.fraction(999, cfg)) == pytest.approx(0.4)
+    assert float(ramp.metabolism_multiplier(0, cfg)) == pytest.approx(
+        0.5 + 0.5 * 0.4, abs=1e-6
+    )
+    assert float(ramp.toxin_strength(0, cfg)) == pytest.approx(0.1 + 0.9 * 0.4, abs=1e-6)
+

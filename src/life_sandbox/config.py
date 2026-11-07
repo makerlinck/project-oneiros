@@ -46,6 +46,10 @@ class WorldConfig:
     bush_regen_nut_multiplier: float = 1.0
     # Diagnostics: allow reseeds only before this tick (-1 = no limit).
     reseed_until_tick: int = -1
+    # Diagnostics: freeze the startup ramp at this fraction (-1 = normal ramp).
+    ramp_fixed_fraction: float = -1.0
+    # Diagnostics: living-target bites deal damage and transfer matter.
+    bite_living_enabled: bool = True
     temperature_scale: float = 1.0
     # Emergency reseed on population < 8 (§5.5).  Diagnostics set this off to
     # observe the true dynamics without rescue.

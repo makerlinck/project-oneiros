@@ -579,3 +579,23 @@ def test_bite_kill_is_not_rescued_by_body():
     assert not death_event["same_lineage"]
     assert death_event["loss"][C.LOSS_BITE] > 0.0
     assert death_event["nutrient"] == -1
+
+
+def test_bite_living_can_be_disabled_for_diagnostics():
+    """Diagnostic switch: living bites neither damage nor transfer matter."""
+    from dataclasses import replace as _replace
+
+    cfg = small_cfg()
+    cfg = _replace(cfg, world=_replace(cfg.world, bite_living_enabled=False))
+    state = add_creature(empty(cfg), 1, pos=(11.0, 10.0), reserves=(0.3, 0.1, 0.0))
+    state = add_creature(state, 0, out=output_row(bite=1.0))
+    out, buffer = interaction.apply(state, cfg)
+    target = out.entities.creature
+    assert float(target.body.I[1]) == pytest.approx(1.0, abs=1e-6)
+    assert jnp.allclose(target.body.B[1], FLESH, atol=1e-6)
+    assert jnp.allclose(target.body.N[1], jnp.asarray([0.3, 0.1, 0.0]), atol=1e-6)
+    assert jnp.allclose(out.entities.creature.body.G[0], jnp.zeros(3), atol=1e-6)
+    bites = of_kind(buffer, "bite")
+    assert len(bites) == 1
+    assert bites[0]["damage"] == pytest.approx(0.0, abs=1e-6)
+
