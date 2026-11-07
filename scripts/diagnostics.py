@@ -1237,6 +1237,10 @@ def design_config(args) -> Config:
         )
     if args.no_bite_living:
         cfg = cfg.replaced(world=replace(cfg.world, bite_living_enabled=False))
+    if args.live_bite_toxin is not None:
+        cfg = cfg.replaced(
+            world=replace(cfg.world, live_bite_toxin=float(args.live_bite_toxin))
+        )
     if args.ramp_metabolism is not None:
         cfg = cfg.replaced(
             world=replace(cfg.world, ramp_metabolism_multiplier=float(args.ramp_metabolism))
@@ -1306,6 +1310,7 @@ def main() -> None:
     parser.add_argument("--snapshots", action="store_true")
     parser.add_argument("--ramp-fraction", type=float, default=None)
     parser.add_argument("--no-bite-living", action="store_true")
+    parser.add_argument("--live-bite-toxin", type=float, default=None)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -1369,6 +1374,7 @@ def main() -> None:
         "reseed_until_tick": cfg.world.reseed_until_tick,
         "ramp_fixed_fraction": cfg.world.ramp_fixed_fraction,
         "bite_living_enabled": cfg.world.bite_living_enabled,
+        "live_bite_toxin": cfg.world.live_bite_toxin,
         "chunk": args.chunk,
     }
     summary["seeds"] = seeds

@@ -50,6 +50,9 @@ class WorldConfig:
     ramp_fixed_fraction: float = -1.0
     # Diagnostics: living-target bites deal damage and transfer matter.
     bite_living_enabled: bool = True
+    # Anti-herbivory toxin of living flesh: share of the taken live mass that
+    # becomes toxin load in the biter instead of nutrients (SANDBOX 5.1/5.4).
+    live_bite_toxin: float = 1.0
     temperature_scale: float = 1.0
     # Emergency reseed on population < 8 (§5.5).  Diagnostics set this off to
     # observe the true dynamics without rescue.
@@ -251,6 +254,8 @@ class Config:
             raise ValueError("body.base_metabolism must be positive")
         if not 0 < self.body.founder_reserves <= 1:
             raise ValueError("body.founder_reserves must be in (0, 1]")
+        if not 0.0 <= self.world.live_bite_toxin <= 1.0:
+            raise ValueError("world.live_bite_toxin must be in [0, 1]")
         if self.body.founder_logit_std <= 0:
             raise ValueError("body.founder_logit_std must be positive")
         for name in (

@@ -276,8 +276,8 @@ def test_bite_carcass_takes_proportional_nutrients():
 
 
 # -------------------------------------------------------- bite: living target
-def test_bite_living_target_damages_and_feeds():
-    """Row living: I -= 0.1*s*(1+k)*g; q = min(0.5*|B+N+G|, 0.03*s*(1+k)*g) (§5.4)."""
+def test_bite_living_target_damages_and_poisons_but_does_not_feed():
+    """Live flesh: I -= 0.1*s*(1+k)*g, but the taken mass becomes toxin (no food)."""
     cfg = small_cfg()
     state = add_creature(empty(cfg), 1, pos=(11.0, 10.0), reserves=(0.3, 0.1, 0.0))
     state = add_creature(state, 0, out=output_row(bite=1.0))
@@ -288,10 +288,15 @@ def test_bite_living_target_damages_and_feeds():
     factor = 1.0 - q / 0.9
     assert jnp.allclose(target.body.B[1], FLESH * factor, atol=1e-6)
     assert jnp.allclose(target.body.N[1], jnp.asarray([0.3, 0.1, 0.0]) * factor, atol=1e-6)
-    assert jnp.allclose(out.entities.creature.body.G[0], jnp.asarray([0.015, 0.015, 0.0]), atol=1e-6)
+    assert jnp.allclose(out.entities.creature.body.G[0], jnp.zeros(3), atol=1e-6)
+    assert float(out.entities.creature.body.X[0]) == pytest.approx(q, abs=1e-6)
+    assert float(jnp.sum(out.ledger.outflow[C.OUTFLOW_TOXIN_LOAD])) == pytest.approx(
+        q, abs=1e-6
+    )
     bites = of_kind(buffer, "bite")
     assert len(bites) == 1 and bites[0]["target_kind"] == C.CREATURE
     assert bites[0]["damage"] == pytest.approx(0.1, abs=1e-6)
+    assert jnp.allclose(jnp.asarray(bites[0]["dn"]), jnp.zeros(3), atol=1e-6)
     assert float(jnp.sum(out.ledger.inflow[C.INFLOW_BITES])) == 0.0
     # §5.5 attribution: the applied bite damage is booked to LOSS_BITE and the
     # acute-pain injury only keeps this tick's bite damage.

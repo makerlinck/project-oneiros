@@ -60,7 +60,7 @@ import jax.numpy as jnp
 from life_sandbox.config import Config
 from life_sandbox.core import components as C
 from life_sandbox.core import events, masks, rng
-from life_sandbox.core.ledger import add_inflow
+from life_sandbox.core.ledger import add_inflow, add_outflow
 from life_sandbox.core.state import WorldState
 from life_sandbox.core.struct import update
 from life_sandbox.core.systems import motor
@@ -674,6 +674,12 @@ def apply(
 
     if not cfg.world.bite_living_enabled:
         take = jnp.where(bite_kind == C.CREATURE, 0.0, take)
+    living = bite_kind == C.CREATURE
+    toxin_share = jnp.asarray(cfg.world.live_bite_toxin, jnp.float32)
+    diverted = jnp.where(
+        living & cfg.world.bite_living_enabled, take * toxin_share, 0.0
+    )
+    transferred = take - diverted
     taken_total = jnp.zeros(total, dtype=jnp.float32).at[bite_id].add(take)
     creature_take = taken_total[offset_creature : offset_creature + n]
     bush_take = taken_total[offset_bush : offset_bush + nb]
@@ -681,7 +687,7 @@ def apply(
 
     dn = jnp.where(
         content_active[:, None],
-        take[:, None] * target_content / jnp.maximum(target_norm[:, None], 1e-9),
+        transferred[:, None] * target_content / jnp.maximum(target_norm[:, None], 1e-9),
         0.0,
     )
 
@@ -696,7 +702,7 @@ def apply(
         N=body.N * creature_factor[:, None],
         G=body.G * creature_factor[:, None],
     )
-    body = update(body, G=body.G + dn)
+    body = update(body, G=body.G + dn, X=body.X + diverted)
     creature = update(creature, body=body)
 
     carcass_factor = jnp.clip(
@@ -805,5 +811,13 @@ def apply(
     # creatures move nutrients inside the book and are not recorded.
     bush_dn = jnp.where((content_active & (bite_kind == C.BUSH))[:, None], dn, 0.0)
     ledger = add_inflow(state.ledger, C.INFLOW_BITES, jnp.sum(bush_dn, axis=0))
+    # The diverted live mass leaves the nutrient book at the composition it had;
+    # it is stored as X (toxin load) but the book tracks nutrient types.
+    diverted_dn = jnp.where(
+        content_active[:, None],
+        diverted[:, None] * target_content / jnp.maximum(target_norm[:, None], 1e-9),
+        0.0,
+    )
+    ledger = add_outflow(ledger, C.OUTFLOW_TOXIN_LOAD, jnp.sum(diverted_dn, axis=0))
     entities = update(entities, creature=creature)
     return update(state, entities=entities, ledger=ledger), buffer
